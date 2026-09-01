@@ -16,6 +16,10 @@ class EndTaskReason(Enum):
     UNEXPECTED_ERROR = "unexpected_error"
     TRANSFER_CALL = "transfer_call"
     PIPELINE_ERROR = "pipeline_error"
+    # Swiss fork P-05: re-add members still referenced by dograh@59a4c9b
+    # (removed upstream in 2c00dc2 before the consumer was migrated)
+    USER_QUALIFIED = "user_qualified"
+    END_CALL_TOOL_REASON = "end_call_tool"
 
 
 class RealtimeFeedbackType(Enum):
