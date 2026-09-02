@@ -22,6 +22,7 @@ from pipecat.frames.frames import (
     StartFrame,
     TTSAudioRawFrame,
     TTSStoppedFrame,
+    UserStartedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.azure.common import language_to_azure_language
@@ -719,6 +720,26 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
             asyncio.run_coroutine_threadsafe(
                 self._audio_queue.put(Exception(error_msg)), self.get_event_loop()
             )
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Process a frame, warming the synthesis socket at user-turn start.
+
+        Opening the connection the moment the user starts speaking makes the
+        whole STT + LLM window (typically 1-3s) lead time, so the reply is
+        never synthesized on a cold socket even if Azure dropped the idle
+        connection since the previous turn. ``open`` is idempotent, so a
+        still-warm socket is unaffected.
+        """
+        if (
+            isinstance(frame, UserStartedSpeakingFrame)
+            and self._keepalive_connection
+            and self._synthesizer_connection is not None
+        ):
+            try:
+                self._synthesizer_connection.open(True)
+            except Exception as e:
+                logger.debug(f"{self} TTS pre-warm on user-start failed: {e}")
+        await super().process_frame(frame, direction)
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
         """Push a frame and handle state changes.
