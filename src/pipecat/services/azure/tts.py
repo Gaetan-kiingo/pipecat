@@ -386,6 +386,7 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
 
         self._speech_config = None
         self._speech_synthesizer = None
+        self._synthesizer_connection = None
         self._audio_queue = asyncio.Queue()
         self._word_boundary_queue = asyncio.Queue()
         self._word_processor_task = None
@@ -450,6 +451,20 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
         self._speech_synthesizer.synthesis_completed.connect(self._handle_completed)
         self._speech_synthesizer.synthesis_canceled.connect(self._handle_canceled)
         self._speech_synthesizer.synthesis_word_boundary.connect(self._handle_word_boundary)
+
+        try:
+            # Pre-open the synthesis websocket during pipeline start so the
+            # first utterance does not pay the TLS + handshake cost at
+            # response time.
+            from azure.cognitiveservices.speech import Connection
+
+            self._synthesizer_connection = Connection.from_speech_synthesizer(
+                self._speech_synthesizer
+            )
+            self._synthesizer_connection.open(True)
+        except Exception as e:
+            logger.debug(f"{self} TTS connection pre-open failed: {e}")
+            self._synthesizer_connection = None
 
         # Start word processor task
         if not self._word_processor_task:
