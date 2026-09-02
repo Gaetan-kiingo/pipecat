@@ -387,6 +387,7 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
         self._speech_config = None
         self._speech_synthesizer = None
         self._synthesizer_connection = None
+        self._keepalive_connection = False
         self._audio_queue = asyncio.Queue()
         self._word_boundary_queue = asyncio.Queue()
         self._word_processor_task = None
@@ -455,12 +456,24 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
         try:
             # Pre-open the synthesis websocket during pipeline start so the
             # first utterance does not pay the TLS + handshake cost at
-            # response time.
+            # response time. Azure drops the socket after a short idle window,
+            # so re-open it on disconnect to keep every turn warm across the
+            # gaps between conversational turns.
             from azure.cognitiveservices.speech import Connection
 
+            self._keepalive_connection = True
             self._synthesizer_connection = Connection.from_speech_synthesizer(
                 self._speech_synthesizer
             )
+
+            def _reopen_on_disconnect(_evt):
+                if self._keepalive_connection and self._synthesizer_connection:
+                    try:
+                        self._synthesizer_connection.open(True)
+                    except Exception as e:
+                        logger.debug(f"{self} TTS connection re-open failed: {e}")
+
+            self._synthesizer_connection.disconnected.connect(_reopen_on_disconnect)
             self._synthesizer_connection.open(True)
         except Exception as e:
             logger.debug(f"{self} TTS connection pre-open failed: {e}")
@@ -495,6 +508,9 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
 
     async def _stop_tasks(self):
         """Cancel the word processor task. Idempotent."""
+        # Stop keeping the synthesis socket warm before teardown so the
+        # disconnect handler does not fight the shutdown by re-opening it.
+        self._keepalive_connection = False
         if self._word_processor_task:
             await self.cancel_task(self._word_processor_task)
             self._word_processor_task = None
