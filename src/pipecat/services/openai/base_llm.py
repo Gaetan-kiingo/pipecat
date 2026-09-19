@@ -32,6 +32,7 @@ from pipecat.frames.frames import (
     Frame,
     FunctionCallsFromLLMInfoFrame,
     LLMContextFrame,
+    TTSSpeakFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
@@ -147,6 +148,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         settings: Settings | None = None,
         retry_timeout_secs: float | None = 5.0,
         retry_on_timeout: bool | None = False,
+        retry_filler_text: str | None = None,
         **kwargs,
     ):
         """Initialize the BaseOpenAILLMService.
@@ -174,6 +176,9 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 parameters, ``settings`` values take precedence.
             retry_timeout_secs: Request timeout in seconds. Defaults to 5.0 seconds.
             retry_on_timeout: Whether to retry the request once if it times out.
+            retry_filler_text: Optional short phrase spoken to the caller when the
+                first attempt times out, so a stalled provider is never met with
+                silence (Swiss Voice patch P-08).
             **kwargs: Additional arguments passed to the parent LLMService.
         """
         # 1. Initialize default_settings with hardcoded defaults
@@ -220,6 +225,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         self._service_tier = service_tier
         self._retry_timeout_secs = retry_timeout_secs
         self._retry_on_timeout = retry_on_timeout
+        self._retry_filler_text = retry_filler_text
         self._full_model_name: str = ""
         self._client = self.create_client(
             api_key=api_key,
@@ -325,10 +331,26 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 )
                 return chunks
             except (TimeoutError, APITimeoutError):
-                # Retry, this time without a timeout so we get a response
-                logger.debug(f"{self}: Retrying chat completion due to timeout")
-                chunks = await self._client.chat.completions.create(**params)
-                return chunks
+                # P-08 (Swiss Voice): a provider stall must not become dead air.
+                # Tell the caller we are still there, then retry ONCE with a bounded
+                # timeout. Upstream retried without any timeout, so a second stall
+                # hung the call until the caller gave up (Phase 0b run 43: 12 s).
+                logger.warning(
+                    f"{self}: chat completion timed out after {self._retry_timeout_secs}s; retrying"
+                )
+                if self._retry_filler_text:
+                    await self.push_frame(TTSSpeakFrame(self._retry_filler_text))
+                retry_timeout = (self._retry_timeout_secs or 5.0) * 2
+                try:
+                    chunks = await asyncio.wait_for(
+                        self._client.chat.completions.create(**params), timeout=retry_timeout
+                    )
+                    return chunks
+                except (TimeoutError, APITimeoutError) as e:
+                    # Surfaces through process_frame as on_completion_timeout + push_error.
+                    raise httpx.TimeoutException(
+                        f"LLM completion timed out twice ({self._retry_timeout_secs}s, {retry_timeout}s)"
+                    ) from e
         else:
             chunks = await self._client.chat.completions.create(**params)
             return chunks
