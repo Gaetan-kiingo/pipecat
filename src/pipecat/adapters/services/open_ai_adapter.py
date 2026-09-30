@@ -6,6 +6,7 @@
 
 """OpenAI LLM adapter for Pipecat."""
 
+import os
 from typing import Any, TypedDict, TypeGuard, TypeVar, cast
 
 from openai._types import NotGiven as OpenAINotGiven
@@ -86,6 +87,38 @@ class OpenAILLMInvocationParams(TypedDict):
     tool_choice: ChatCompletionToolChoiceOptionParam | OpenAINotGiven
 
 
+def _svp_place_system_instruction(system_instruction: str, messages: list) -> list:
+    """P-26 (Swiss Voice Platform, ADR-002): the part of the system instruction that changes
+    every turn is sent after the history, so a provider that caches the prompt by its
+    *messages prefix* (Azure OpenAI, OpenAI) keeps the fixed part cached. Stock behaviour -
+    one system message in front - when ``SVP_TRAILING_CONTEXT`` is unset or the instruction
+    has no such section.
+
+    ``SVP_TRAILING_CONTEXT`` names the section header at which the instruction splits
+    (the platform's compiler ends every step with ``[NOW]``, ``[ALREADY KNOWN]``,
+    ``[LANGUAGE]``): everything from that header on becomes a second system message placed
+    **just before the last user message** - never at the very end (Mistral refuses a request
+    ending with a system message) and never between an assistant's tool call and its result
+    (OpenAI refuses that). Without a user message yet (the greeting turn) the instruction
+    stays whole.
+    """
+    header = os.environ.get("SVP_TRAILING_CONTEXT", "").strip()
+    if header:
+        cut = system_instruction.find(f"\n{header}\n")
+        if cut >= 0:
+            last_user = next(
+                (i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"),
+                None,
+            )
+            if last_user is not None:
+                head = system_instruction[:cut].rstrip()
+                tail = system_instruction[cut:].strip()
+                placed = [{"role": "system", "content": head}] + list(messages)
+                placed.insert(last_user + 1, {"role": "system", "content": tail})
+                return placed
+    return [{"role": "system", "content": system_instruction}] + list(messages)
+
+
 class OpenAILLMAdapter(BaseLLMAdapter[OpenAILLMInvocationParams]):
     """OpenAI-specific adapter for Pipecat.
 
@@ -141,7 +174,7 @@ class OpenAILLMAdapter(BaseLLMAdapter[OpenAILLMInvocationParams]):
                 system_instruction,
                 discard_context_system=False,
             )
-            messages = [{"role": "system", "content": system_instruction}] + messages
+            messages = _svp_place_system_instruction(system_instruction, messages)
 
         return cast(
             OpenAILLMInvocationParams,
