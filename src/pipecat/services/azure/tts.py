@@ -7,8 +7,10 @@
 """Azure Cognitive Services Text-to-Speech service implementations."""
 
 import asyncio
+import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
+from typing import Any
 
 from loguru import logger
 from pydantic import BaseModel
@@ -20,11 +22,13 @@ from pipecat.frames.frames import (
     Frame,
     InterruptionFrame,
     StartFrame,
+    SVPTimingMarkFrame,
     TTSAudioRawFrame,
     TTSStoppedFrame,
     UserStartedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
+from pipecat.services.azure import svp_voice_timing
 from pipecat.services.azure.common import language_to_azure_language
 from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven, assert_given
 from pipecat.services.tts_service import TextAggregationMode, TTSService
@@ -390,6 +394,10 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
         self._synthesizer_connection = None
         self._keepalive_connection = False
         self._audio_queue = asyncio.Queue()
+        # Swiss Voice Platform P-28: what each sentence cost, on the run's timeline
+        self._svp_timing = svp_voice_timing.enabled()
+        self._svp_connection_open: bool | None = None
+        self._svp_request: dict[str, Any] | None = None
         self._word_boundary_queue = asyncio.Queue()
         self._word_processor_task = None
         self._cumulative_audio_offset: float = 0.0  # Cumulative audio duration in seconds
@@ -475,6 +483,13 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
                         logger.debug(f"{self} TTS connection re-open failed: {e}")
 
             self._synthesizer_connection.disconnected.connect(_reopen_on_disconnect)
+            if self._svp_timing:
+                self._synthesizer_connection.connected.connect(
+                    lambda _evt: self._svp_connection_changed(True)
+                )
+                self._synthesizer_connection.disconnected.connect(
+                    lambda _evt: self._svp_connection_changed(False)
+                )
             self._synthesizer_connection.open(True)
         except Exception as e:
             logger.debug(f"{self} TTS connection pre-open failed: {e}")
@@ -665,12 +680,24 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
             except Exception as e:
                 await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
 
+    def _svp_connection_changed(self, is_open: bool):
+        """Note the synthesis connection opening or dropping (an SDK thread)."""
+        self._svp_connection_open = is_open
+        asyncio.run_coroutine_threadsafe(
+            self.push_frame(
+                SVPTimingMarkFrame(mark=svp_voice_timing.CONNECTION_MARK, data={"open": is_open})
+            ),
+            self.get_event_loop(),
+        )
+
     def _handle_synthesizing(self, evt):
         """Handle audio chunks as they arrive.
 
         Args:
             evt: Synthesis event containing audio data.
         """
+        if self._svp_request is not None and "first_audio_at" not in self._svp_request:
+            self._svp_request["first_audio_at"] = time.time()
         if evt.result and evt.result.audio_data:
             asyncio.run_coroutine_threadsafe(
                 self._audio_queue.put(evt.result.audio_data), self.get_event_loop()
@@ -685,6 +712,20 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
         # Store duration for cumulative offset calculation
         if evt.result and evt.result.audio_duration:
             self._current_sentence_duration = evt.result.audio_duration.total_seconds()
+
+        if self._svp_timing and self._svp_request is not None:
+            request, self._svp_request = self._svp_request, None
+            data = svp_voice_timing.azure_latencies(evt.result)
+            data["open_at_request"] = request["open"]
+            data["chars"] = request["chars"]
+            if "first_audio_at" in request:
+                data["local_first_ms"] = int(
+                    (request["first_audio_at"] - request["sent_at"]) * 1000
+                )
+            asyncio.run_coroutine_threadsafe(
+                self.push_frame(SVPTimingMarkFrame(mark=svp_voice_timing.MARK, data=data)),
+                self.get_event_loop(),
+            )
 
         # Flush any pending word before completing
         if self._last_word is not None:
@@ -835,6 +876,12 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
                 self._current_sentence_max_word_offset = 0.0
 
                 ssml = self._construct_ssml(text)
+                if self._svp_timing:
+                    self._svp_request = {
+                        "sent_at": time.time(),
+                        "open": self._svp_connection_open,
+                        "chars": len(text),
+                    }
                 self._speech_synthesizer.speak_ssml_async(ssml)
                 await self.start_tts_usage_metrics(text)
 
