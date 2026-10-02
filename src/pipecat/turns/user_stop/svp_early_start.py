@@ -47,11 +47,13 @@ _APOSTROPHES = re.compile(r"['’ʼ]")
 
 
 def mode() -> str:
+    """The switch: ``off`` (stock), ``observe`` or ``on``."""
     value = os.getenv("SVP_EARLY_START", "").strip().lower()
     return value if value in ("observe", "on") else "off"
 
 
 def has_digit(text: str) -> bool:
+    """Whether the text holds a digit, which makes the match rule strict."""
     return any(char.isdigit() for char in text)
 
 
@@ -75,6 +77,7 @@ def matches(provisional: str, final: str) -> bool:
 
 
 def joined(parts: list[str], interim: str = "") -> str:
+    """The turn's text: its final segments, then the interim hypothesis if any."""
     return " ".join(part.strip() for part in [*parts, interim] if part and part.strip())
 
 
@@ -90,6 +93,13 @@ class EarlyStartObserver:
         create_task: Callable[[Any, str], asyncio.Task],
         cancel_task: Callable[[asyncio.Task], Awaitable[None]],
     ):
+        """Initialize the observer.
+
+        Args:
+            emit: Reports one observation (the mark's data).
+            create_task: Starts a task the owner tracks.
+            cancel_task: Cancels such a task.
+        """
         self._emit = emit
         self._create_task = create_task
         self._cancel_task = cancel_task
@@ -99,13 +109,16 @@ class EarlyStartObserver:
         self._task: asyncio.Task | None = None
 
     def on_interim(self, text: str) -> None:
+        """Keep the hypothesis of the segment in flight."""
         self._interim = text
 
     def on_final(self, text: str) -> None:
+        """Keep a segment the recogniser committed."""
         self._finals.append(text)
         self._interim = ""  # the hypothesis in flight was this segment's
 
     async def on_vad_stopped(self) -> None:
+        """Start looking at what an early start would have."""
         await self._stop_looking()
         self._snapshots = []
         self._task = self._create_task(self._look(), "svp_early_start::look")
@@ -125,6 +138,7 @@ class EarlyStartObserver:
         self._snapshots = []
 
     async def on_turn_stopped(self) -> None:
+        """Report each look against the text the turn finally held."""
         await self._stop_looking()
         final = joined(self._finals)
         now = time.time()
@@ -159,6 +173,7 @@ class EarlyStartObserver:
         self._snapshots = []
 
     async def reset(self) -> None:
+        """Forget the turn."""
         await self._stop_looking()
         self._finals = []
         self._interim = ""
