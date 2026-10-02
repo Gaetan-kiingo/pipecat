@@ -15,7 +15,7 @@ from pipecat.frames.frames import (
 from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy, svp_early_start
 from pipecat.utils.asyncio.task_manager import TaskManager, TaskManagerParams
 
-WINDOW = 0.45  # longer than the observer's last look (0.3 s)
+WINDOW = 0.65  # longer than the observer's last look (0.5 s)
 
 
 def interim(text):
@@ -105,7 +105,7 @@ class TestObserveMode(unittest.IsolatedAsyncioTestCase):
         await strategy.process_frame(VADUserStartedSpeakingFrame())
         await strategy.process_frame(interim("où êtes vous situé"))
         await strategy.process_frame(VADUserStoppedSpeakingFrame())
-        await asyncio.sleep(0.36)  # every look is taken on the interim
+        await asyncio.sleep(0.56)  # every look is taken on the interim
         await strategy.process_frame(final("Où êtes-vous situé ?"))
         await asyncio.sleep(WINDOW)
         self.assertEqual(len(self.stops), 1)  # the turn ends exactly as it does without us
@@ -115,7 +115,15 @@ class TestObserveMode(unittest.IsolatedAsyncioTestCase):
             ("early_start", "observe", "ended"),
         )
         self.assertFalse(mark.data["digits"])
-        self.assertEqual([look["after"] for look in mark.data["looks"]], [0.0, 0.1, 0.2, 0.3])
+        self.assertEqual(
+            [look["after"] for look in mark.data["looks"]], [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+        )
+        # the recogniser's own timing: the hypothesis was settled before silence was
+        # detected, the final came 0.56 s after it, the turn ended at the window's close
+        self.assertTrue(mark.data["last_interim_match"])
+        self.assertLess(mark.data["last_interim_after"], 0.05)
+        self.assertAlmostEqual(mark.data["final_after"], 0.56, delta=0.08)
+        self.assertGreaterEqual(mark.data["turn_end_after"], mark.data["final_after"])
         self.assertTrue(all(look["ready"] and look["match"] for look in mark.data["looks"]))
         # the first look was the earliest, so it has the longest lead over the turn's end
         leads = [look["lead"] for look in mark.data["looks"]]
@@ -135,14 +143,24 @@ class TestObserveMode(unittest.IsolatedAsyncioTestCase):
         await strategy.process_frame(final("Je voudrais un devis existant."))
         await asyncio.sleep(WINDOW)
         [mark] = self.marks
-        self.assertEqual([look["match"] for look in mark.data["looks"]], [False, False, True, True])
+        self.assertEqual(
+            [look["match"] for look in mark.data["looks"]],
+            [False, False, True, True, True, True],
+        )
+        # the last two looks came after the final: nothing was left to gain there
+        self.assertEqual(
+            [look["final_in"] for look in mark.data["looks"]],
+            [False, False, False, False, True, True],
+        )
+        self.assertTrue(mark.data["last_interim_match"])
+        self.assertAlmostEqual(mark.data["last_interim_after"], 0.15, delta=0.06)
 
     async def test_a_number_written_otherwise_is_no_match(self):
         strategy = await self._strategy("observe")
         await strategy.process_frame(VADUserStartedSpeakingFrame())
         await strategy.process_frame(interim("deux mille vingt-six tiret zéro deux"))
         await strategy.process_frame(VADUserStoppedSpeakingFrame())
-        await asyncio.sleep(0.36)
+        await asyncio.sleep(0.56)
         await strategy.process_frame(final("2026 tiret 02."))
         await asyncio.sleep(WINDOW)
         [mark] = self.marks
@@ -155,7 +173,7 @@ class TestObserveMode(unittest.IsolatedAsyncioTestCase):
         await strategy.process_frame(final("Non merci."))
         await strategy.process_frame(interim("au revoir"))
         await strategy.process_frame(VADUserStoppedSpeakingFrame())
-        await asyncio.sleep(0.36)
+        await asyncio.sleep(0.56)
         await strategy.process_frame(final("Au revoir."))
         await asyncio.sleep(WINDOW)
         [mark] = self.marks
@@ -179,7 +197,7 @@ class TestObserveMode(unittest.IsolatedAsyncioTestCase):
         await strategy.process_frame(VADUserStartedSpeakingFrame())
         await strategy.process_frame(interim("mon numéro est le 079"))
         await strategy.process_frame(VADUserStoppedSpeakingFrame())
-        await asyncio.sleep(0.36)
+        await asyncio.sleep(0.56)
         await strategy.process_frame(final("Mon numéro est le 079."))
         await asyncio.sleep(WINDOW)
         self.assertNotIn("079", str([mark.data for mark in self.marks]))

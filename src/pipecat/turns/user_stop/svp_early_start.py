@@ -38,7 +38,7 @@ from loguru import logger
 
 MARK = "early_start"
 # seconds after the voice-activity stop at which the observer looks
-OFFSETS = (0.0, 0.1, 0.2, 0.3)
+OFFSETS = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5)
 
 _SPACES = re.compile(r"\s+")
 _CLOSING = " .!?…"
@@ -107,13 +107,21 @@ class EarlyStartObserver:
         self._interim = ""
         self._snapshots: list[dict[str, Any]] = []
         self._task: asyncio.Task | None = None
+        # the recogniser's own timing: when silence was detected, when the hypothesis
+        # last changed, what it was just before the final replaced it, when that came
+        self._vad_stopped_at: float | None = None
+        self._interim_at: float | None = None
+        self._before_final: tuple[str, float | None, float] | None = None
 
     def on_interim(self, text: str) -> None:
         """Keep the hypothesis of the segment in flight."""
+        if text != self._interim:
+            self._interim_at = time.time()
         self._interim = text
 
     def on_final(self, text: str) -> None:
         """Keep a segment the recogniser committed."""
+        self._before_final = (joined(self._finals, self._interim), self._interim_at, time.time())
         self._finals.append(text)
         self._interim = ""  # the hypothesis in flight was this segment's
 
@@ -121,6 +129,7 @@ class EarlyStartObserver:
         """Start looking at what an early start would have."""
         await self._stop_looking()
         self._snapshots = []
+        self._vad_stopped_at = time.time()
         self._task = self._create_task(self._look(), "svp_early_start::look")
 
     async def on_vad_started(self) -> None:
@@ -160,16 +169,23 @@ class EarlyStartObserver:
                         f"svp early start (observe): at +{snapshot['after']}s "
                         f"[{snapshot['text']}] != final [{final}]"
                     )
-            await self._emit(
-                {
-                    "mode": "observe",
-                    "outcome": "ended",
-                    "digits": has_digit(final),
-                    "chars": len(final),
-                    "segments": len(self._finals),
-                    "looks": looks,
-                }
-            )
+            data: dict[str, Any] = {
+                "mode": "observe",
+                "outcome": "ended",
+                "digits": has_digit(final),
+                "chars": len(final),
+                "segments": len(self._finals),
+                "looks": looks,
+            }
+            stopped = self._vad_stopped_at
+            if self._before_final and stopped:
+                last_text, last_at, final_at = self._before_final
+                # the best an early start could do: the last hypothesis before the final
+                data["last_interim_match"] = matches(last_text, final)
+                data["last_interim_after"] = round(last_at - stopped, 3) if last_at else None
+                data["final_after"] = round(final_at - stopped, 3)
+                data["turn_end_after"] = round(now - stopped, 3)
+            await self._emit(data)
         self._snapshots = []
 
     async def reset(self) -> None:
@@ -178,6 +194,9 @@ class EarlyStartObserver:
         self._finals = []
         self._interim = ""
         self._snapshots = []
+        self._vad_stopped_at = None
+        self._interim_at = None
+        self._before_final = None
 
     async def _look(self) -> None:
         started = time.time()
