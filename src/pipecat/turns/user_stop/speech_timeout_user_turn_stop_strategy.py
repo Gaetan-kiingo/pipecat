@@ -15,11 +15,13 @@ from pipecat.frames.frames import (
     Frame,
     InterimTranscriptionFrame,
     STTMetadataFrame,
+    SVPTimingMarkFrame,
     TranscriptionFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.turns.types import ProcessFrameResult
+from pipecat.turns.user_stop import svp_early_start
 from pipecat.turns.user_stop.base_user_turn_stop_strategy import BaseUserTurnStopStrategy
 from pipecat.utils.asyncio.task_manager import BaseTaskManager
 
@@ -88,6 +90,21 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
         self._user_speech_wait_done: bool = False
         self._stt_wait_done: bool = False
 
+        # P-29 (Swiss Voice Platform): what an early start on the interim transcript
+        # would have had. None unless SVP_EARLY_START=observe - stock otherwise.
+        self._early_observer: svp_early_start.EarlyStartObserver | None = None
+        if svp_early_start.mode() == "observe":
+            self._early_observer = svp_early_start.EarlyStartObserver(
+                emit=self._emit_early_start_mark,
+                create_task=lambda coroutine, name: self.task_manager.create_task(
+                    coroutine, f"{self}::{name}"
+                ),
+                cancel_task=lambda task: self.task_manager.cancel_task(task),
+            )
+
+    async def _emit_early_start_mark(self, data: dict) -> None:
+        await self.push_frame(SVPTimingMarkFrame(mark=svp_early_start.MARK, data=data))
+
     @property
     def wait_for_transcript(self) -> bool:
         """Whether transcripts gate end-of-turn signalling."""
@@ -123,6 +140,8 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
         self._text = ""
         if clear_vad_user_speaking:
             self._vad_user_speaking = False
+        if self._early_observer:
+            await self._early_observer.reset()
         await self._discard_pending_end_of_turn()
 
     async def _discard_pending_end_of_turn(self):
@@ -185,12 +204,16 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
             # on silences shorter than the VAD stop_secs — e.g. an aggressive
             # STT endpoint or a manually raised stop_secs.
             self._transcript_finalized = False
+            if self._early_observer:
+                self._early_observer.on_interim(frame.text)
 
         return ProcessFrameResult.CONTINUE
 
     async def _handle_vad_user_started_speaking(self, _: VADUserStartedSpeakingFrame):
         """Handle when the VAD indicates the user is speaking."""
         self._vad_user_speaking = True
+        if self._early_observer:
+            await self._early_observer.on_vad_started()
         await self._discard_pending_end_of_turn()
 
     async def _handle_vad_user_stopped_speaking(self, frame: VADUserStoppedSpeakingFrame):
@@ -219,6 +242,9 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
                     f"user_turn_stop_timeout parameter in the LLMUserAggregatorParams."
                 )
 
+        if self._early_observer:
+            await self._early_observer.on_vad_stopped()
+
         # user_speech_timeout is the policy floor and always runs. A prior
         # fallback-mode run of the same timer is superseded here.
         await self._restart_user_speech_timer()
@@ -238,6 +264,8 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
     async def _handle_transcription(self, frame: TranscriptionFrame):
         """Handle user transcription."""
         self._text += frame.text
+        if self._early_observer:
+            self._early_observer.on_final(frame.text)
 
         if frame.finalized:
             self._transcript_finalized = True
@@ -322,6 +350,8 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
             return
 
         if self._user_speech_wait_done and self._stt_wait_done:
+            if self._early_observer:
+                await self._early_observer.on_turn_stopped()
             await self.trigger_user_turn_stopped()
 
     async def _cancel_all_tasks(self):

@@ -1193,6 +1193,19 @@ class BotSpeakingFrame(SystemFrame):
 
 
 @dataclass
+class SVPTimingMarkFrame(SystemFrame):
+    """A timing mark for the run's timeline (Swiss Voice Platform, ADR-002 P-28/P-29).
+
+    Parameters:
+        mark: The mark's name.
+        data: Times, lengths and booleans describing it - never a transcript.
+    """
+
+    mark: str
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class MetricsFrame(SystemFrame):
     """Frame containing performance metrics data.
 
