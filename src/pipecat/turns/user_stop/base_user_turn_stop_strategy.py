@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 from pipecat.frames.frames import Frame
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat.turns.types import ProcessFrameResult
+from pipecat.turns.types import ProcessFrameResult, UserTurnSpeculation
 from pipecat.utils.base_object import BaseObject
 
 
@@ -29,10 +29,13 @@ class UserTurnStoppedParams:
             This is typically enabled by default, but may be disabled when another
             component (such as an STT service) is already responsible for
             generating user speaking frames.
+        confirms_speculation: Whether this turn end confirms a speculative
+            answer already generated: only the context write is still owed.
 
     """
 
     enable_user_speaking_frames: bool
+    confirms_speculation: bool = False
 
 
 class BaseUserTurnStopStrategy(BaseObject):
@@ -74,6 +77,7 @@ class BaseUserTurnStopStrategy(BaseObject):
         self._register_event_handler("on_broadcast_frame", sync=True)
         self._register_event_handler("on_user_turn_inference_triggered", sync=True)
         self._register_event_handler("on_user_turn_stopped", sync=True)
+        self._register_event_handler("on_user_turn_speculation_cancelled", sync=True)
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -174,13 +178,37 @@ class BaseUserTurnStopStrategy(BaseObject):
         await self.trigger_user_turn_inference_triggered()
         await self.trigger_user_turn_finalized()
 
-    async def trigger_user_turn_inference_triggered(self):
-        """Trigger only the `on_user_turn_inference_triggered` event."""
-        await self._call_event_handler("on_user_turn_inference_triggered")
+    async def trigger_user_turn_speculation_cancelled(self):
+        """Withdraw the speculation this strategy has in flight."""
+        await self._call_event_handler("on_user_turn_speculation_cancelled")
 
-    async def trigger_user_turn_finalized(self):
-        """Trigger only the `on_user_turn_stopped` event."""
+    async def trigger_user_turn_inference_triggered(
+        self, *, speculation: UserTurnSpeculation | None = None
+    ):
+        """Trigger only the `on_user_turn_inference_triggered` event.
+
+        Args:
+            speculation: Set to run this inference speculatively, against a
+                provisional context, for a turn that has not ended.
+        """
+        # An ordinary trigger keeps its one-argument shape, so a handler written
+        # before speculation existed is called exactly as it was.
+        if speculation is None:
+            await self._call_event_handler("on_user_turn_inference_triggered")
+        else:
+            await self._call_event_handler("on_user_turn_inference_triggered", speculation)
+
+    async def trigger_user_turn_finalized(self, *, confirms_speculation: bool = False):
+        """Trigger only the `on_user_turn_stopped` event.
+
+        Args:
+            confirms_speculation: Whether a response generated ahead of this turn
+                end still stands, so no inference runs again.
+        """
         await self._call_event_handler(
             "on_user_turn_stopped",
-            UserTurnStoppedParams(enable_user_speaking_frames=self._enable_user_speaking_frames),
+            UserTurnStoppedParams(
+                enable_user_speaking_frames=self._enable_user_speaking_frames,
+                confirms_speculation=confirms_speculation,
+            ),
         )

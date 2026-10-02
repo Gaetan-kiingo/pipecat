@@ -33,6 +33,7 @@ from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.adapters.services.open_ai_adapter import OpenAILLMAdapter
 from pipecat.frames.frames import (
     CancelFrame,
+    EagerEndOfTurnCancelFrame,
     EndFrame,
     ErrorFrame,
     Frame,
@@ -65,6 +66,7 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.ai_service import AIService
 from pipecat.services.settings import LLMSettings, assert_given
 from pipecat.services.websocket_service import WebsocketService
+from pipecat.turns.speculation_gate import SpeculationGate
 from pipecat.turns.user_turn_completion_mixin import UserTurnCompletionLLMServiceMixin
 from pipecat.utils.async_tool_cancellation import (
     ASYNC_TOOL_CANCELLATION_INSTRUCTIONS,
@@ -317,6 +319,9 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         # Turn completion is owned by LLMTurnCompletionUserTurnStopStrategy, which
         # enables it over an LLMUpdateSettingsFrame once the pipeline starts.
         self._filter_incomplete_user_turns: bool = False
+        # Holds a speculative response until its turn is confirmed. Frames are
+        # routed through it on the way out, in `push_frame`.
+        self._speculation_gate = SpeculationGate(name=f"{self}::SpeculationGate")
         self._warn_turn_completion_settings_are_strategy_owned()
         self._async_tool_cancellation_enabled: bool = False
         # The user's base system instruction, without composed addons. Captured
@@ -596,8 +601,15 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         """
         await super().process_frame(frame, direction)
 
+        if isinstance(frame, LLMContextFrame):
+            # Before the subclass starts the completion, so the gate knows what
+            # this inference answers before any of its frames arrive.
+            self._speculation_gate.begin_speculation(frame.speculation)
+
         if isinstance(frame, InterruptionFrame):
             await self._handle_interruptions(frame)
+        elif isinstance(frame, EagerEndOfTurnCancelFrame):
+            await self._handle_eager_end_of_turn_cancel(frame)
         elif isinstance(frame, LLMConfigureOutputFrame):
             self._skip_tts = frame.skip_tts
         elif isinstance(frame, LLMUpdateSettingsFrame):
@@ -644,7 +656,27 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
             if self._skip_tts is not None:
                 frame.skip_tts = self._skip_tts
 
-        await super().push_frame(frame, direction)
+        # The gate decides synchronously, so its verdict can't be torn by
+        # another task pushing at the same time. Everything it hands back is
+        # pushed past it - routing that back through here would re-gate it.
+        emitted = self._speculation_gate.process(frame, direction)
+        for gated_frame, gated_direction in emitted:
+            await super().push_frame(gated_frame, gated_direction)
+
+    async def _handle_eager_end_of_turn_cancel(self, frame: EagerEndOfTurnCancelFrame):
+        """Stop generating a response whose user turn turned out to be unfinished.
+
+        Unlike an interruption this leaves the turn open - the bot never spoke,
+        and the user is still mid-turn.
+        """
+        # Runs before the frame reaches the gate, which is what clears the
+        # speculation, so this still sees the one being withdrawn.
+        if not self._speculation_gate.is_speculating:
+            return
+
+        logger.debug(f"{self}: speculative answer withdrawn, stopping the inference")
+        await self._start_interruption()
+        await self.stop_all_metrics()
 
     async def _push_llm_text(self, text: str):
         """Push LLM text, using turn completion detection if enabled.
@@ -1279,6 +1311,16 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
             function_calls: The function calls to execute.
         """
         if len(function_calls) == 0:
+            return
+
+        if self._speculation_gate.is_speculating:
+            # Tools run inside the service, so no downstream gate can undo their
+            # side effects if the speculation is discarded. Withdraw it instead;
+            # the inference that follows the committed transcript runs the call.
+            # A turn confirmed before the call was reached leaves nothing
+            # pending, and the call runs as an ordinary one.
+            logger.debug(f"{self}: speculative inference wants a tool call, cancelling it")
+            await self.broadcast_frame(EagerEndOfTurnCancelFrame)
             return
 
         # Exclude the built-in cancel tool — it's an internal mechanism and

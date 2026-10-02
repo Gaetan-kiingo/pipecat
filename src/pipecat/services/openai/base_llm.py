@@ -29,13 +29,14 @@ from pydantic import BaseModel, Field
 from pipecat.adapters.services.open_ai_adapter import OpenAILLMAdapter, OpenAILLMInvocationParams
 from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
+    EagerEndOfTurnCancelFrame,
     Frame,
     FunctionCallsFromLLMInfoFrame,
     LLMContextFrame,
-    TTSSpeakFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
+    TTSSpeakFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -597,6 +598,12 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         text_generated: bool,
     ) -> None:
         """Defer node-transition batches until their preceding TTS completes."""
+        if self._speculation_gate.is_speculating:
+            # Swiss Voice Platform P-29: a speculative answer never runs a tool or
+            # changes step, and never leaves one pending behind it.
+            logger.debug(f"{self}: speculative inference wants a function call, cancelling it")
+            await self.broadcast_frame(EagerEndOfTurnCancelFrame)
+            return
         contains_node_transition = any(
             self._function_is_node_transition(fc.function_name) for fc in function_calls
         )

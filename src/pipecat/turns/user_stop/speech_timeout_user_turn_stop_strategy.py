@@ -12,6 +12,7 @@ from loguru import logger
 
 from pipecat.audio.vad.vad_analyzer import VAD_STOP_SECS
 from pipecat.frames.frames import (
+    EagerEndOfTurnCancelFrame,
     Frame,
     InterimTranscriptionFrame,
     STTMetadataFrame,
@@ -20,7 +21,7 @@ from pipecat.frames.frames import (
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
-from pipecat.turns.types import ProcessFrameResult
+from pipecat.turns.types import ProcessFrameResult, UserTurnSpeculation
 from pipecat.turns.user_stop import svp_early_start
 from pipecat.turns.user_stop.base_user_turn_stop_strategy import BaseUserTurnStopStrategy
 from pipecat.utils.asyncio.task_manager import BaseTaskManager
@@ -93,6 +94,18 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
         # P-29 (Swiss Voice Platform): what an early start on the interim transcript
         # would have had. None unless SVP_EARLY_START=observe - stock otherwise.
         self._early_observer: svp_early_start.EarlyStartObserver | None = None
+        self._early_starter: svp_early_start.EarlyStarter | None = None
+        if svp_early_start.mode() == "on":
+            self._early_starter = svp_early_start.EarlyStarter(
+                speculate=self._speculate_on,
+                withdraw=self.trigger_user_turn_speculation_cancelled,
+                emit=self._emit_early_start_mark,
+                is_speaking=lambda: self._vad_user_speaking,
+                create_task=lambda coroutine, name: self.task_manager.create_task(
+                    coroutine, f"{self}::{name}"
+                ),
+                cancel_task=lambda task: self.task_manager.cancel_task(task),
+            )
         if svp_early_start.mode() == "observe":
             self._early_observer = svp_early_start.EarlyStartObserver(
                 emit=self._emit_early_start_mark,
@@ -101,6 +114,9 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
                 ),
                 cancel_task=lambda task: self.task_manager.cancel_task(task),
             )
+
+    async def _speculate_on(self, text: str) -> None:
+        await self.trigger_user_turn_inference_triggered(speculation=UserTurnSpeculation(text=text))
 
     async def _emit_early_start_mark(self, data: dict) -> None:
         await self.push_frame(SVPTimingMarkFrame(mark=svp_early_start.MARK, data=data))
@@ -142,6 +158,8 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
             self._vad_user_speaking = False
         if self._early_observer:
             await self._early_observer.reset()
+        if self._early_starter:
+            await self._early_starter.reset()
         await self._discard_pending_end_of_turn()
 
     async def _discard_pending_end_of_turn(self):
@@ -206,6 +224,12 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
             self._transcript_finalized = False
             if self._early_observer:
                 self._early_observer.on_interim(frame.text)
+            if self._early_starter:
+                await self._early_starter.on_interim(frame.text)
+        elif isinstance(frame, EagerEndOfTurnCancelFrame):
+            # the LLM service withdrew the speculative answer (it wanted a tool call)
+            if self._early_starter:
+                await self._early_starter.on_withdrawn_elsewhere()
 
         return ProcessFrameResult.CONTINUE
 
@@ -214,6 +238,8 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
         self._vad_user_speaking = True
         if self._early_observer:
             await self._early_observer.on_vad_started()
+        if self._early_starter:
+            await self._early_starter.on_vad_started()
         await self._discard_pending_end_of_turn()
 
     async def _handle_vad_user_stopped_speaking(self, frame: VADUserStoppedSpeakingFrame):
@@ -244,6 +270,8 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
 
         if self._early_observer:
             await self._early_observer.on_vad_stopped()
+        if self._early_starter:
+            await self._early_starter.on_vad_stopped()
 
         # user_speech_timeout is the policy floor and always runs. A prior
         # fallback-mode run of the same timer is superseded here.
@@ -266,6 +294,8 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
         self._text += frame.text
         if self._early_observer:
             self._early_observer.on_final(frame.text)
+        if self._early_starter:
+            await self._early_starter.on_final(frame.text)
 
         if frame.finalized:
             self._transcript_finalized = True
@@ -352,6 +382,10 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
         if self._user_speech_wait_done and self._stt_wait_done:
             if self._early_observer:
                 await self._early_observer.on_turn_stopped()
+            if self._early_starter and await self._early_starter.on_turn_stopping():
+                # the answer started early still stands: only the turn's end is owed
+                await self.trigger_user_turn_finalized(confirms_speculation=True)
+                return
             await self.trigger_user_turn_stopped()
 
     async def _cancel_all_tasks(self):

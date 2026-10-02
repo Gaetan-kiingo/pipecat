@@ -202,3 +202,189 @@ class TestObserveMode(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(WINDOW)
         self.assertNotIn("079", str([mark.data for mark in self.marks]))
         self.assertNotIn("numéro", str([mark.data for mark in self.marks]))
+
+
+FAST = {
+    "SVP_EARLY_START": "on",
+    "SVP_EARLY_START_AFTER_MS": "60",
+    "SVP_EARLY_START_SETTLE_MS": "60",
+}
+ON_WINDOW = 0.5
+
+
+class TestEarlyStart(unittest.IsolatedAsyncioTestCase):
+    """``on``: the strategy starts a speculative inference and resolves it at the turn's end."""
+
+    async def asyncSetUp(self) -> None:
+        self.task_manager = TaskManager()
+        self.task_manager.setup(TaskManagerParams(loop=asyncio.get_running_loop()))
+        self._env = patch.dict("os.environ", FAST)
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    async def _strategy(self):
+        strategy = SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=ON_WINDOW)
+        await strategy.setup(self.task_manager)
+        await strategy.process_frame(STTMetadataFrame(service_name="test", ttfs_p99_latency=0.0))
+        self.events, self.marks = [], []
+
+        @strategy.event_handler("on_user_turn_inference_triggered")
+        async def on_inference(strategy, speculation=None):
+            self.events.append(("inference", speculation.text if speculation else None))
+
+        @strategy.event_handler("on_user_turn_stopped")
+        async def on_stopped(strategy, params):
+            self.events.append(("stopped", params.confirms_speculation))
+            await strategy.handle_user_turn_stopped()  # as the controller does
+
+        @strategy.event_handler("on_user_turn_speculation_cancelled")
+        async def on_cancelled(strategy):
+            self.events.append(("cancelled", None))
+
+        @strategy.event_handler("on_push_frame")
+        async def on_push_frame(strategy, frame, direction):
+            if isinstance(frame, SVPTimingMarkFrame):
+                self.marks.append(frame.data)
+
+        await strategy.handle_user_turn_started()
+        return strategy
+
+    async def test_a_settled_hypothesis_is_answered_early_and_confirmed_at_the_turns_end(self):
+        strategy = await self._strategy()
+        await strategy.process_frame(VADUserStartedSpeakingFrame())
+        await strategy.process_frame(interim("où êtes vous situé"))
+        await strategy.process_frame(VADUserStoppedSpeakingFrame())
+        await asyncio.sleep(0.2)
+        # started inside the wait, on the hypothesis; the turn is still open
+        self.assertEqual(self.events, [("inference", "où êtes vous situé")])
+        await strategy.process_frame(final("Où êtes-vous situé ?"))
+        await asyncio.sleep(ON_WINDOW)
+        # the turn ends once, confirming: no second inference
+        self.assertEqual(self.events, [("inference", "où êtes vous situé"), ("stopped", True)])
+        [mark] = self.marks
+        self.assertEqual(
+            (mark["mode"], mark["outcome"], mark["digits"]), ("on", "confirmed", False)
+        )
+        self.assertGreater(mark["lead"], 0.2)
+
+    async def test_a_final_that_differs_withdraws_the_answer_and_the_turn_is_answered_again(self):
+        strategy = await self._strategy()
+        await strategy.process_frame(VADUserStartedSpeakingFrame())
+        await strategy.process_frame(interim("je voudrais un devis"))
+        await strategy.process_frame(VADUserStoppedSpeakingFrame())
+        await asyncio.sleep(0.2)
+        await strategy.process_frame(final("Je voudrais un devis existant."))
+        await asyncio.sleep(ON_WINDOW)
+        self.assertEqual(
+            self.events,
+            [
+                ("inference", "je voudrais un devis"),
+                ("cancelled", None),
+                ("inference", None),  # the ordinary one, on the committed text
+                ("stopped", False),
+            ],
+        )
+        self.assertEqual([m["outcome"] for m in self.marks], ["redone"])
+
+    async def test_a_number_written_otherwise_is_answered_again(self):
+        strategy = await self._strategy()
+        await strategy.process_frame(VADUserStartedSpeakingFrame())
+        await strategy.process_frame(interim("1.5"))
+        await strategy.process_frame(VADUserStoppedSpeakingFrame())
+        await asyncio.sleep(0.2)
+        await strategy.process_frame(final("15"))
+        await asyncio.sleep(ON_WINDOW)
+        self.assertEqual(
+            [e[0] for e in self.events], ["inference", "cancelled", "inference", "stopped"]
+        )
+        self.assertTrue(self.marks[0]["digits"])
+
+    async def test_a_caller_who_resumes_withdraws_the_answer_and_the_turn_stays_open(self):
+        strategy = await self._strategy()
+        await strategy.process_frame(VADUserStartedSpeakingFrame())
+        await strategy.process_frame(interim("non c'est zéro"))
+        await strategy.process_frame(VADUserStoppedSpeakingFrame())
+        await asyncio.sleep(0.2)
+        await strategy.process_frame(VADUserStartedSpeakingFrame())
+        self.assertEqual(self.events, [("inference", "non c'est zéro"), ("cancelled", None)])
+        self.assertEqual([m["outcome"] for m in self.marks], ["resumed"])
+        # the rest of the sentence: one ordinary... or early answer, never two
+        await strategy.process_frame(interim("non c'est zéro deux"))
+        await strategy.process_frame(VADUserStoppedSpeakingFrame())
+        await asyncio.sleep(0.2)
+        await strategy.process_frame(final("Non, c'est zéro deux."))
+        await asyncio.sleep(ON_WINDOW)
+        self.assertEqual(
+            self.events[-2:], [("inference", "non c'est zéro deux"), ("stopped", True)]
+        )
+
+    async def test_a_hypothesis_that_still_changes_is_not_answered_until_it_settles(self):
+        strategy = await self._strategy()
+        await strategy.process_frame(VADUserStartedSpeakingFrame())
+        await strategy.process_frame(interim("merci"))
+        await strategy.process_frame(VADUserStoppedSpeakingFrame())
+        for text in ("merci beaucoup", "merci beaucoup au", "merci beaucoup au revoir"):
+            await asyncio.sleep(0.03)  # the recogniser is catching up with the audio
+            await strategy.process_frame(interim(text))
+        self.assertEqual(self.events, [])
+        await asyncio.sleep(0.15)
+        self.assertEqual(self.events, [("inference", "merci beaucoup au revoir")])
+
+    async def test_a_hypothesis_that_changes_after_the_start_withdraws_it_and_starts_again(self):
+        strategy = await self._strategy()
+        await strategy.process_frame(VADUserStartedSpeakingFrame())
+        await strategy.process_frame(interim("je voudrais un rendez-vous"))
+        await strategy.process_frame(VADUserStoppedSpeakingFrame())
+        await asyncio.sleep(0.15)
+        await strategy.process_frame(interim("je voudrais un rendez-vous demain"))
+        await asyncio.sleep(0.15)
+        self.assertEqual(
+            self.events,
+            [
+                ("inference", "je voudrais un rendez-vous"),
+                ("cancelled", None),
+                ("inference", "je voudrais un rendez-vous demain"),
+            ],
+        )
+        self.assertEqual([m["outcome"] for m in self.marks], ["changed"])
+
+    async def test_an_answer_the_llm_withdrew_leaves_the_turn_to_end_the_ordinary_way(self):
+        from pipecat.frames.frames import EagerEndOfTurnCancelFrame
+
+        strategy = await self._strategy()
+        await strategy.process_frame(VADUserStartedSpeakingFrame())
+        await strategy.process_frame(interim("quel est le statut de mon devis"))
+        await strategy.process_frame(VADUserStoppedSpeakingFrame())
+        await asyncio.sleep(0.2)
+        await strategy.process_frame(EagerEndOfTurnCancelFrame())  # it wanted a tool call
+        await strategy.process_frame(final("Quel est le statut de mon devis ?"))
+        await asyncio.sleep(ON_WINDOW)
+        self.assertEqual(
+            self.events,
+            [
+                ("inference", "quel est le statut de mon devis"),
+                ("inference", None),
+                ("stopped", False),
+            ],
+        )
+        self.assertEqual([m["outcome"] for m in self.marks], ["tool"])
+
+    async def test_a_final_already_in_is_answered_inside_the_rest_of_the_window(self):
+        strategy = await self._strategy()
+        await strategy.process_frame(VADUserStartedSpeakingFrame())
+        await strategy.process_frame(final("Oui."))
+        await strategy.process_frame(VADUserStoppedSpeakingFrame())
+        await asyncio.sleep(0.15)
+        self.assertEqual(self.events, [("inference", "Oui.")])
+        await asyncio.sleep(ON_WINDOW)
+        self.assertEqual(self.events, [("inference", "Oui."), ("stopped", True)])
+
+    async def test_a_mark_never_carries_a_transcript(self):
+        strategy = await self._strategy()
+        await strategy.process_frame(VADUserStartedSpeakingFrame())
+        await strategy.process_frame(interim("mon numéro est le 079"))
+        await strategy.process_frame(VADUserStoppedSpeakingFrame())
+        await asyncio.sleep(0.2)
+        await strategy.process_frame(final("Mon numéro est le 079."))
+        await asyncio.sleep(ON_WINDOW)
+        self.assertNotIn("079", str(self.marks))

@@ -562,9 +562,12 @@ class LLMContextFrame(Frame):
 
     Parameters:
         context: The LLM context containing messages, tools, and configuration.
+        speculation: Whether this inference is speculative, run for a user turn
+            that has not ended: its response is held until the turn is confirmed.
     """
 
     context: LLMContext
+    speculation: bool = False
 
 
 @dataclass
@@ -1187,6 +1190,19 @@ class BotSpeakingFrame(SystemFrame):
     still speaking. This can be used, for example, to detect when a user is
     idle. That is, while the bot is speaking we don't want to trigger any user
     idle timeout since the user might be listening.
+    """
+
+    pass
+
+
+@dataclass
+class EagerEndOfTurnCancelFrame(SystemFrame):
+    """Frame withdrawing a speculative answer to a user turn that had not ended.
+
+    Emitted when the user resumed speaking, when the committed transcript does not
+    match the text the answer was started on, or when the answer wanted a tool
+    call. The speculation gate discards what it holds. A system frame so it
+    overtakes the speculative output it cancels.
     """
 
     pass
