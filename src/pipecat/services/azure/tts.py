@@ -7,6 +7,8 @@
 """Azure Cognitive Services Text-to-Speech service implementations."""
 
 import asyncio
+import threading
+import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 
@@ -268,6 +270,15 @@ class AzureBaseTTSService:
         return escaped_text
 
 
+# P-30 (ADR-002): Azure's ``Connection.open`` is a blocking native call. It is made in a
+# thread of its own - never on the event loop, where one call that did not return stopped
+# every call of the process (2026-10-05), and never in the shared thread pool, whose
+# workers a hung call would use up.
+_WARM_START_WAIT_SECONDS = 3.0  # how long the pipeline's start waits for its first open
+_WARM_STUCK_SECONDS = 5.0  # an open older than this is reported, once
+_WARM_POLL_SECONDS = 0.005
+
+
 class AzureTTSService(TTSService, AzureBaseTTSService):
     """Azure Cognitive Services streaming TTS service with word timestamps.
 
@@ -389,6 +400,12 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
         self._speech_synthesizer = None
         self._synthesizer_connection = None
         self._keepalive_connection = False
+        # P-30: the warm-up's own thread, and whether the socket is in use
+        self._synthesis_under_way = False
+        self._warm_lock = threading.Lock()
+        self._warm_thread: threading.Thread | None = None
+        self._warm_started = 0.0
+        self._warm_reported = False
         self._audio_queue = asyncio.Queue()
         self._word_boundary_queue = asyncio.Queue()
         self._word_processor_task = None
@@ -468,14 +485,14 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
             )
 
             def _reopen_on_disconnect(_evt):
-                if self._keepalive_connection and self._synthesizer_connection:
-                    try:
-                        self._synthesizer_connection.open(True)
-                    except Exception as e:
-                        logger.debug(f"{self} TTS connection re-open failed: {e}")
+                # called on one of the speech library's own threads: it must not wait
+                # for the open either (P-30)
+                self._warm_connection("disconnect")
 
             self._synthesizer_connection.disconnected.connect(_reopen_on_disconnect)
-            self._synthesizer_connection.open(True)
+            # The first open is waited for - so the first sentence finds the socket
+            # open, as before - but off the loop and for a bounded time (P-30).
+            await self._wait_for_warm(self._warm_connection("start"), _WARM_START_WAIT_SECONDS)
         except Exception as e:
             logger.debug(f"{self} TTS connection pre-open failed: {e}")
             self._synthesizer_connection = None
@@ -506,6 +523,66 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
         """Clean up the Azure TTS service."""
         await super().cleanup()
         await self._stop_tasks()
+
+    def _warm_connection(self, reason: str) -> threading.Thread | None:
+        """Open the synthesis socket in a thread of its own, never waiting for it (P-30).
+
+        ``Connection.open`` is idempotent on an open socket and blocking on a closed
+        one; on 2026-10-05 it did not return at all, called on the event loop while a
+        synthesis had just started. So: nothing is opened while a synthesis is under
+        way (the socket is in use), one open at a time per service (while one has not
+        returned, no other is started - a hung call leaks one thread, not one per
+        caller turn), and the caller of this method never waits.
+
+        Returns the thread it started, or None when it started none.
+        """
+        connection = self._synthesizer_connection
+        if not self._keepalive_connection or connection is None:
+            return None
+        if self._synthesis_under_way:
+            return None
+        with self._warm_lock:
+            running = self._warm_thread
+            if running is not None and running.is_alive():
+                age = time.monotonic() - self._warm_started
+                if age > _WARM_STUCK_SECONDS and not self._warm_reported:
+                    self._warm_reported = True
+                    logger.warning(
+                        f"{self} TTS connection open has not returned after {age:.1f}s "
+                        f"(asked again at {reason}); no other open is started"
+                    )
+                return None
+
+            def _open():
+                try:
+                    connection.open(True)
+                except Exception as e:
+                    logger.debug(f"{self} TTS connection open failed ({reason}): {e}")
+
+            thread = threading.Thread(target=_open, name="azure-tts-warm", daemon=True)
+            self._warm_thread = thread
+            self._warm_started = time.monotonic()
+            self._warm_reported = False
+            thread.start()
+            return thread
+
+    async def _wait_for_warm(self, thread: threading.Thread | None, limit: float) -> bool:
+        """Wait, without blocking the loop, until a warm-up returns or ``limit`` passes.
+
+        Returns whether it returned. The pipeline goes on either way: a sentence opens
+        the socket itself when it is not open, as stock does.
+        """
+        if thread is None:
+            return True
+        deadline = time.monotonic() + limit
+        while thread.is_alive() and time.monotonic() < deadline:
+            await asyncio.sleep(_WARM_POLL_SECONDS)
+        if thread.is_alive():
+            logger.warning(
+                f"{self} TTS connection open did not return within {limit:.1f}s; going on"
+            )
+            return False
+        return True
 
     async def _stop_tasks(self):
         """Cancel the word processor task. Idempotent."""
@@ -727,18 +804,12 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
         Opening the connection the moment the user starts speaking makes the
         whole STT + LLM window (typically 1-3s) lead time, so the reply is
         never synthesized on a cold socket even if Azure dropped the idle
-        connection since the previous turn. ``open`` is idempotent, so a
-        still-warm socket is unaffected.
+        connection since the previous turn. The open runs in its own thread and
+        is skipped while a sentence is being synthesized (P-30): made here, on
+        the event loop, it once did not return and stopped every call.
         """
-        if (
-            isinstance(frame, UserStartedSpeakingFrame)
-            and self._keepalive_connection
-            and self._synthesizer_connection is not None
-        ):
-            try:
-                self._synthesizer_connection.open(True)
-            except Exception as e:
-                logger.debug(f"{self} TTS pre-warm on user-start failed: {e}")
+        if isinstance(frame, UserStartedSpeakingFrame):
+            self._warm_connection("user-start")
         await super().process_frame(frame, direction)
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
@@ -785,6 +856,8 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
                 await asyncio.to_thread(result_future.get)
             except Exception as e:
                 await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
+        # the synthesis is stopped: the socket is free again (P-30)
+        self._synthesis_under_way = False
 
         # Reset state on interruption
         self._reset_state()
@@ -835,6 +908,9 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
                 self._current_sentence_max_word_offset = 0.0
 
                 ssml = self._construct_ssml(text)
+                # from here to the end of this sentence the socket is in use: no
+                # warm-up is started on it (P-30)
+                self._synthesis_under_way = True
                 self._speech_synthesizer.speak_ssml_async(ssml)
                 await self.start_tts_usage_metrics(text)
 
@@ -874,6 +950,9 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
 
         except Exception as e:
             yield ErrorFrame(error=f"Unknown error occurred: {e}")
+        finally:
+            # also when the sentence is interrupted and this generator is closed
+            self._synthesis_under_way = False
 
 
 class AzureHttpTTSService(TTSService, AzureBaseTTSService):
