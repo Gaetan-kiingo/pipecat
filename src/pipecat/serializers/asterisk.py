@@ -5,12 +5,15 @@ chan_websocket / externalMedia over binary WebSocket frames.
 """
 
 import json
+import os
 from typing import TYPE_CHECKING
 
 from loguru import logger
 
 from pipecat.audio.utils import create_stream_resampler, pcm_to_ulaw, ulaw_to_pcm
+from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.frames.frames import (
+    InputDTMFFrame,
     AudioRawFrame,
     CancelFrame,
     EndFrame,
@@ -24,6 +27,11 @@ from pipecat.utils.enums import EndTaskReason
 
 if TYPE_CHECKING:
     from pipecat.serializers.call_strategies import HangupStrategy, TransferStrategy
+
+
+def _svp_text_messages() -> bool:
+    """P-39: `SVP_ARI_TEXT_MESSAGES=on`; unset = stock (plain text logged as a JSON failure)."""
+    return os.environ.get("SVP_ARI_TEXT_MESSAGES", "").strip().lower() in ("on", "1", "true")
 
 
 class AsteriskFrameSerializer(FrameSerializer):
@@ -205,5 +213,42 @@ class AsteriskFrameSerializer(FrameSerializer):
                 logger.debug(f"Asterisk WebSocket event: {event} - {message}")
                 return None
             except json.JSONDecodeError:
+                if _svp_text_messages():
+                    return self._svp_text_message(data)
                 logger.warning(f"Failed to parse JSON message from Asterisk: {data}")
                 return None
+
+    # P-39 (Swiss Voice Platform, ADR-002; CF-175): chan_websocket's plain-text control
+    # messages - `EVENT key:value ...` - read instead of logged as broken JSON. A keypad
+    # press becomes the pipeline's DTMF frame (TEL-009, CALL-003: a human at any time by
+    # keypad - D4); the flow-control and status messages are kept at debug level.
+    _SVP_QUIET_EVENTS = (
+        "MEDIA_START",
+        "MEDIA_XOFF",
+        "MEDIA_XON",
+        "STATUS",
+        "MEDIA_BUFFERING_COMPLETED",
+        "QUEUE_DRAINED",
+    )
+
+    def _svp_text_message(self, data: str) -> Frame | None:
+        parts = data.strip().split()
+        if not parts:
+            return None
+        event, fields = parts[0], {}
+        for part in parts[1:]:
+            key, sep, value = part.partition(":")
+            if sep:
+                fields[key] = value
+        if event == "DTMF_END":
+            digit = fields.get("digit", "")
+            try:
+                return InputDTMFFrame(button=KeypadEntry(digit))
+            except ValueError:
+                logger.warning(f"Asterisk DTMF_END with an unknown digit: {digit!r}")
+                return None
+        if event in self._SVP_QUIET_EVENTS:
+            logger.debug(f"Asterisk media message: {event} {fields}")
+            return None
+        logger.warning(f"Unknown text message from Asterisk: {data[:120]}")
+        return None

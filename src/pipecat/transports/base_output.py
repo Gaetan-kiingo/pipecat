@@ -11,6 +11,7 @@ output processing, including frame buffering, mixing, timing, and media streamin
 """
 
 import asyncio
+import os
 import itertools
 import time
 from collections.abc import AsyncGenerator, Mapping
@@ -24,6 +25,7 @@ from pipecat.audio.dtmf.utils import load_dtmf_audio
 from pipecat.audio.mixers.base_audio_mixer import BaseAudioMixer
 from pipecat.audio.utils import create_stream_resampler, is_silence
 from pipecat.frames.frames import (
+    HeartbeatFrame,
     AssistantImageRawFrame,
     BotOutputAudioPauseFrame,
     BotOutputAudioResumeFrame,
@@ -57,6 +59,11 @@ from pipecat.utils.time import nanoseconds_to_seconds
 
 BOT_VAD_STOP_SECS = 0.35
 DRAIN_POLL_SECS = 0.25
+
+
+def _svp_heartbeat_bypass() -> bool:
+    """P-38: `SVP_HEARTBEAT_BYPASS_OUTPUT=on`; unset = stock (the heartbeat waits behind the audio)."""
+    return os.environ.get("SVP_HEARTBEAT_BYPASS_OUTPUT", "").strip().lower() in ("on", "1", "true")
 
 
 class BaseOutputTransport(FrameProcessor):
@@ -358,6 +365,14 @@ class BaseOutputTransport(FrameProcessor):
         elif isinstance(frame, OutputDTMFUrgentFrame):
             await self.write_dtmf(frame)
         elif isinstance(frame, SystemFrame):
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, HeartbeatFrame) and _svp_heartbeat_bypass():
+            # P-38 (Swiss Voice Platform, ADR-002; CF-174): the pipeline's heartbeat is a
+            # control frame, queued behind the audio; a transport that paces the audio in
+            # real time (the telephony WebSockets) holds it for the length of the sentence
+            # being spoken, and a sentence over ten seconds makes the monitor cry stall on
+            # every phone call. The heartbeat proves the chain up to here is moving; it is
+            # pushed on at once instead of waiting for the sound to be played out.
             await self.push_frame(frame, direction)
         elif direction == FrameDirection.UPSTREAM:
             await self.push_frame(frame, direction)
