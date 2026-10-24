@@ -52,18 +52,13 @@ from pipecat.frames.frames import (
     TTSAudioRawFrame,
     TTSStoppedFrame,
 )
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, svp_heartbeat_bypass
 from pipecat.transports.base_transport import TransportParams
 from pipecat.utils.frame_queue import FrameQueue
 from pipecat.utils.time import nanoseconds_to_seconds
 
 BOT_VAD_STOP_SECS = 0.35
 DRAIN_POLL_SECS = 0.25
-
-
-def _svp_heartbeat_bypass() -> bool:
-    """P-38: `SVP_HEARTBEAT_BYPASS_OUTPUT=on`; unset = stock (the heartbeat waits behind the audio)."""
-    return os.environ.get("SVP_HEARTBEAT_BYPASS_OUTPUT", "").strip().lower() in ("on", "1", "true")
 
 
 class BaseOutputTransport(FrameProcessor):
@@ -366,7 +361,7 @@ class BaseOutputTransport(FrameProcessor):
             await self.write_dtmf(frame)
         elif isinstance(frame, SystemFrame):
             await self.push_frame(frame, direction)
-        elif isinstance(frame, HeartbeatFrame) and _svp_heartbeat_bypass():
+        elif isinstance(frame, HeartbeatFrame) and svp_heartbeat_bypass():
             # P-38 (Swiss Voice Platform, ADR-002; CF-174): the pipeline's heartbeat is a
             # control frame, queued behind the audio; a transport that paces the audio in
             # real time (the telephony WebSockets) holds it for the length of the sentence

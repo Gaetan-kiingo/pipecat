@@ -21,6 +21,7 @@ from loguru import logger
 
 from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import (
+    HeartbeatFrame,
     AggregatedTextFrame,
     AggregationType,
     BotStartedSpeakingFrame,
@@ -46,7 +47,7 @@ from pipecat.frames.frames import (
     TTSTextFrame,
     TTSUpdateSettingsFrame,
 )
-from pipecat.processors.frame_processor import FrameDirection
+from pipecat.processors.frame_processor import FrameDirection, svp_heartbeat_bypass
 from pipecat.services.ai_service import AIService
 from pipecat.services.settings import TTSSettings, is_given
 from pipecat.services.websocket_service import WebsocketService
@@ -870,7 +871,11 @@ class TTSService(AIService):
                 # are already queued (e.g. a FooFrame sent right after a TTSSpeakFrame must
                 # not overtake the TTSStartedFrame / TTSAudioRawFrame / TTSStoppedFrame
                 # sequence from that speak frame).
-                await self._serialization_queue.put(frame)
+                if isinstance(frame, HeartbeatFrame) and svp_heartbeat_bypass():
+                    # P-38: the heartbeat does not wait behind the audio contexts
+                    await self.push_frame(frame, direction)
+                else:
+                    await self._serialization_queue.put(frame)
             else:
                 await self.push_frame(frame, direction)
 

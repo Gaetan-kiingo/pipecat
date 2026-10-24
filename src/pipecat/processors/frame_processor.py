@@ -14,6 +14,7 @@ management, and frame flow control mechanisms.
 from __future__ import annotations
 
 import asyncio
+import os
 import dataclasses
 import traceback
 import warnings
@@ -29,6 +30,7 @@ from loguru import logger
 
 from pipecat.clocks.base_clock import BaseClock
 from pipecat.frames.frames import (
+    HeartbeatFrame,
     CancelFrame,
     ErrorFrame,
     Frame,
@@ -114,6 +116,13 @@ class FrameProcessorSetup:
                     )
             return value
         return object.__getattribute__(self, name)
+
+
+def svp_heartbeat_bypass() -> bool:
+    """P-38: `SVP_HEARTBEAT_BYPASS=on` - the pipeline's heartbeat is never held by a paused
+    processor, the TTS service's ordering queue or an output transport's paced audio queue;
+    unset = stock (the heartbeat waits in order behind the audio)."""
+    return os.environ.get("SVP_HEARTBEAT_BYPASS", "").strip().lower() in ("on", "1", "true")
 
 
 class FrameProcessorQueue(asyncio.PriorityQueue):
@@ -612,6 +621,20 @@ class FrameProcessor(BaseObject):
         """
         # If we are cancelling we don't want to process any other frame.
         if self._cancelling:
+            return
+
+        if (
+            self.__should_block_frames
+            and isinstance(frame, HeartbeatFrame)
+            and svp_heartbeat_bypass()
+        ):
+            # P-38 (Swiss Voice Platform, ADR-002; CF-174): a paused processor (the TTS
+            # service while the bot speaks) would hold the pipeline's heartbeat for the
+            # length of the sentence being played out; on a transport that paces the audio
+            # in real time that is longer than the monitor's window, and every phone call
+            # logged a false stall. The heartbeat passes a paused processor at once: what
+            # it proves is that every processor still takes frames.
+            await self.push_frame(frame, direction)
             return
 
         if self._enable_direct_mode:
