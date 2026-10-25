@@ -36,8 +36,11 @@ from pipecat.utils.tracing.service_decorators import traced_stt
 
 try:
     from azure.cognitiveservices.speech import (
+        AutoDetectSourceLanguageConfig,
+        AutoDetectSourceLanguageResult,
         CancellationReason,
         ProfanityOption,
+        PropertyId,
         ResultReason,
         SpeechConfig,
         SpeechRecognizer,
@@ -87,6 +90,10 @@ class AzureSTTSettings(STTSettings):
     """
 
     profanity: AzureProfanity | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    # P-07 (Swiss Voice Platform, ADR-058): the locales the recogniser may hear, for
+    # Azure's continuous language identification. None or one locale = stock recognition
+    # in ``language``. With two or more, every transcript carries the locale Azure heard.
+    languages: list[str] | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class AzureSTTService(STTService):
@@ -140,6 +147,7 @@ class AzureSTTService(STTService):
             model=None,
             language=Language.EN_US,
             profanity=None,
+            languages=None,
         )
 
         # 2. Apply direct init arg overrides (deprecated)
@@ -191,6 +199,29 @@ class AzureSTTService(STTService):
 
         self._audio_stream = None
         self._speech_recognizer = None
+        self._auto_detect_config = self._build_auto_detect()
+
+    def _build_auto_detect(self):
+        """P-07: Azure's continuous language identification among the given locales -
+        None when fewer than two are given (stock recognition in one language)."""
+        languages = assert_given(self._settings.languages)
+        locales = [str(lang) for lang in (languages or []) if str(lang)]
+        if len(locales) < 2:
+            return None
+        self._speech_config.set_property(
+            PropertyId.SpeechServiceConnection_LanguageIdMode, "Continuous"
+        )
+        return AutoDetectSourceLanguageConfig(languages=locales)
+
+    def _detected_language(self, result) -> str | None:
+        """P-07: the locale Azure identified for a result, when identification is on."""
+        if self._auto_detect_config is None:
+            return None
+        try:
+            detected = AutoDetectSourceLanguageResult(result).language
+        except Exception:  # noqa: BLE001 - identification is a hint, never a failure
+            return None
+        return str(detected) if detected else None
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate performance metrics.
@@ -235,10 +266,14 @@ class AzureSTTService(STTService):
 
         if "profanity" in changed:
             self._apply_profanity()
+        if "languages" in changed:
+            self._auto_detect_config = self._build_auto_detect()
 
         # Both settings are baked into the recognizer at connect time, so a
         # live change only takes effect after a reconnect.
-        if ("language" in changed or "profanity" in changed) and self._audio_stream:
+        if (
+            "language" in changed or "profanity" in changed or "languages" in changed
+        ) and self._audio_stream:
             await self._disconnect()
             await self._connect()
 
@@ -307,9 +342,16 @@ class AzureSTTService(STTService):
 
             audio_config = AudioConfig(stream=self._audio_stream)
 
-            self._speech_recognizer = SpeechRecognizer(
-                speech_config=self._speech_config, audio_config=audio_config
-            )
+            if self._auto_detect_config is not None:
+                self._speech_recognizer = SpeechRecognizer(
+                    speech_config=self._speech_config,
+                    audio_config=audio_config,
+                    auto_detect_source_language_config=self._auto_detect_config,
+                )
+            else:
+                self._speech_recognizer = SpeechRecognizer(
+                    speech_config=self._speech_config, audio_config=audio_config
+                )
             self._speech_recognizer.recognizing.connect(self._on_handle_recognizing)
             self._speech_recognizer.recognized.connect(self._on_handle_recognized)
             self._speech_recognizer.canceled.connect(self._on_handle_canceled)
@@ -342,7 +384,9 @@ class AzureSTTService(STTService):
             # a StrEnum so downstream handles either.
             language = cast(
                 "Language | None",
-                getattr(event.result, "language", None) or assert_given(self._settings.language),
+                self._detected_language(event.result)
+                or getattr(event.result, "language", None)
+                or assert_given(self._settings.language),
             )
             # Azure's ``RecognizedSpeech`` event is by definition the final
             # recognition for an utterance — mark the frame as such so that
@@ -371,7 +415,9 @@ class AzureSTTService(STTService):
             # a StrEnum so downstream handles either.
             language = cast(
                 "Language | None",
-                getattr(event.result, "language", None) or assert_given(self._settings.language),
+                self._detected_language(event.result)
+                or getattr(event.result, "language", None)
+                or assert_given(self._settings.language),
             )
             frame = InterimTranscriptionFrame(
                 event.result.text,
