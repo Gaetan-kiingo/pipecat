@@ -18,6 +18,7 @@ import httpx
 from loguru import logger
 from openai import (
     NOT_GIVEN,
+    APIError,
     APITimeoutError,
     AsyncOpenAI,
     AsyncStream,
@@ -166,6 +167,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         retry_timeout_secs: float | None = 5.0,
         retry_on_timeout: bool | None = False,
         retry_filler_text: str | None = None,
+        svp_fallback: dict | None = None,
         **kwargs,
     ):
         """Initialize the BaseOpenAILLMService.
@@ -196,6 +198,11 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
             retry_filler_text: Optional short phrase spoken to the caller when the
                 first attempt times out, so a stalled provider is never met with
                 silence (Swiss Voice patch P-08).
+            svp_fallback: Swiss Voice patch P-46 - another OpenAI-compatible engine of the
+                same approved chain (``base_url``, ``api_key``, ``model``, ``extra_body``,
+                ``after_secs``): a request whose first chunk has not come within
+                ``after_secs``, or that fails before it, is asked again of this engine in the
+                same turn; after two such turns the rest of the call stays on it.
             **kwargs: Additional arguments passed to the parent LLMService.
         """
         # 1. Initialize default_settings with hardcoded defaults
@@ -244,6 +251,11 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         self._retry_on_timeout = retry_on_timeout
         self._retry_filler_text = retry_filler_text
         self._full_model_name: str = ""
+        # P-46 (Swiss Voice): the in-call fallback, None = stock
+        self._svp_fallback = dict(svp_fallback) if svp_fallback else None
+        self._svp_fallback_client = None
+        self._svp_primary_failures = 0
+        self._svp_on_fallback = False
         self._client = self.create_client(
             api_key=api_key,
             base_url=base_url,
@@ -341,6 +353,9 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
 
         params = self.build_chat_completion_params(params_from_context)
 
+        if self._svp_fallback:
+            return await self._svp_completions_with_fallback(params)
+
         if self._retry_on_timeout:
             try:
                 chunks = await asyncio.wait_for(
@@ -371,6 +386,87 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         else:
             chunks = await self._client.chat.completions.create(**params)
             return chunks
+
+    # --- P-46 (Swiss Voice Platform): the in-call fallback ---------------------------------------
+
+    _SVP_SWITCH_AFTER_FAILURES = 2
+
+    def _svp_fallback_params(self, params: dict) -> dict:
+        fallback = self._svp_fallback or {}
+        out = {k: v for k, v in params.items() if k != "extra_body"}
+        out["model"] = fallback["model"]
+        if fallback.get("extra_body"):
+            out["extra_body"] = dict(fallback["extra_body"])
+        return out
+
+    async def _svp_fallback_stream(self, params: dict, reason: str):
+        fallback = self._svp_fallback or {}
+        if self._svp_fallback_client is None:
+            self._svp_fallback_client = self.create_client(
+                api_key=fallback.get("api_key"), base_url=fallback.get("base_url")
+            )
+        logger.warning(
+            f"P-46: {self._settings.model} {reason}; this turn on the fallback {fallback['model']}"
+            + (" (the rest of the call too)" if self._svp_on_fallback else "")
+        )
+        timeout = max((self._retry_timeout_secs or 5.0) * 2, 5.0)
+        try:
+            return await asyncio.wait_for(
+                self._svp_fallback_client.chat.completions.create(
+                    **self._svp_fallback_params(params)
+                ),
+                timeout=timeout,
+            )
+        except (TimeoutError, APITimeoutError) as e:
+            # Surfaces through process_frame as on_completion_timeout + push_error.
+            raise httpx.TimeoutException(
+                f"P-46: the fallback {fallback['model']} did not answer within {timeout}s"
+            ) from e
+
+    async def _svp_completions_with_fallback(self, params: dict):
+        """The primary engine has ``after_secs`` to give its first chunk; a failure or a
+        silence until then sends the same request to the fallback, in this turn."""
+        if self._svp_on_fallback:
+            return await self._svp_fallback_stream(params, "was left after two failures")
+        after = float((self._svp_fallback or {}).get("after_secs") or 1.5)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + after
+        stream = None
+        try:
+            stream = await asyncio.wait_for(
+                self._client.chat.completions.create(**params), timeout=after
+            )
+            iterator = stream.__aiter__()
+            first = await asyncio.wait_for(
+                iterator.__anext__(), timeout=max(deadline - loop.time(), 0.01)
+            )
+        except (TimeoutError, APITimeoutError):
+            reason = f"gave no first word within {after}s"
+        except StopAsyncIteration:
+            reason = "answered nothing"
+        except APIError as e:
+            reason = f"failed ({type(e).__name__}: {str(e)[:160]})"
+        else:
+            self._svp_primary_failures = 0
+
+            async def chunks():
+                try:
+                    yield first
+                    async for chunk in iterator:
+                        yield chunk
+                finally:
+                    await stream.close()
+
+            return chunks()
+        if stream is not None:
+            try:
+                await stream.close()
+            except Exception:  # noqa: BLE001 - the primary is being left anyway
+                pass
+        self._svp_primary_failures += 1
+        if self._svp_primary_failures >= self._SVP_SWITCH_AFTER_FAILURES:
+            self._svp_on_fallback = True
+        return await self._svp_fallback_stream(params, reason)
 
     def build_chat_completion_params(self, params_from_context: OpenAILLMInvocationParams) -> dict:
         """Build parameters for chat completion request.
