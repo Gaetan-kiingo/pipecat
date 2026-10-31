@@ -6,6 +6,7 @@
 
 """Tests for node-transition function-call deferral in OpenAI LLM services."""
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -198,3 +199,60 @@ async def test_p45_a_blank_line_before_a_step_change_is_not_speech(monkeypatch):
 async def test_p45_words_before_a_step_change_still_wait_for_the_voice(monkeypatch):
     chunks = [_chunk(content="\n"), _chunk(content="Un instant."), _chunk(tool_name="vers_fin")]
     assert await _stream_signal(monkeypatch, "on", chunks) is True
+
+
+# --- P-47 (Swiss Voice Platform): a held step change never waits for a voice that never starts --
+
+
+def _guarded_service(monkeypatch, timeout_ms: str | None):
+    if timeout_ms is None:
+        monkeypatch.delenv("SVP_HELD_TRANSITION_TIMEOUT_MS", raising=False)
+    else:
+        monkeypatch.setenv("SVP_HELD_TRANSITION_TIMEOUT_MS", timeout_ms)
+    service = _make_service()
+    service.register_function("vers_rendez_vous", AsyncMock(), is_node_transition=True)
+    service.run_function_calls = AsyncMock()
+    tasks = []
+    service.create_task = lambda coro, name=None: tasks.append(asyncio.ensure_future(coro)) or tasks[-1]
+
+    async def cancel(task, timeout=None):
+        task.cancel()
+
+    service.cancel_task = cancel
+    return service, tasks
+
+
+@pytest.mark.asyncio
+async def test_p47_a_held_step_change_runs_when_no_voice_starts(monkeypatch):
+    # the words that held it were dropped before the voice (the spoken-text guard)
+    service, tasks = _guarded_service(monkeypatch, "50")
+    call = _make_function_call("vers_rendez_vous", "c1")
+    await service._run_or_defer_function_calls([call], text_generated=True)
+    service.run_function_calls.assert_not_awaited()
+    await asyncio.gather(*tasks)
+    service.run_function_calls.assert_awaited_once_with([call])
+    assert service._pending_node_transition_function_calls == []
+
+
+@pytest.mark.asyncio
+async def test_p47_a_voice_that_started_keeps_the_stock_wait(monkeypatch):
+    from pipecat.frames.frames import BotStartedSpeakingFrame
+    from pipecat.processors.frame_processor import FrameDirection
+
+    service, tasks = _guarded_service(monkeypatch, "50")
+    service.push_frame = AsyncMock()
+    call = _make_function_call("vers_rendez_vous", "c1")
+    await service._run_or_defer_function_calls([call], text_generated=True)
+    await service.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM)
+    await asyncio.gather(*tasks)
+    service.run_function_calls.assert_not_awaited()  # BotStoppedSpeaking will run it
+    assert service._pending_node_transition_function_calls == [call]
+
+
+@pytest.mark.asyncio
+async def test_p47_switched_off_is_stock(monkeypatch):
+    service, tasks = _guarded_service(monkeypatch, None)
+    await service._run_or_defer_function_calls(
+        [_make_function_call("vers_rendez_vous", "c1")], text_generated=True
+    )
+    assert tasks == []

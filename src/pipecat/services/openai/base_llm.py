@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 
 from pipecat.adapters.services.open_ai_adapter import OpenAILLMAdapter, OpenAILLMInvocationParams
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     Frame,
     FunctionCallsFromLLMInfoFrame,
@@ -57,6 +58,19 @@ def svp_spoken_text_only() -> bool:
     transition waited for a voice that never spoke and the call fell silent (2026-10-30, runs
     9-10). Unset = stock (any non-empty chunk counts)."""
     return os.environ.get("SVP_SPOKEN_TEXT_ONLY", "").strip().lower() in ("on", "1", "true")
+
+
+def svp_held_transition_timeout() -> float | None:
+    """P-47 (Swiss Voice Platform): `SVP_HELD_TRANSITION_TIMEOUT_MS` - a step change held until
+    the voice has spoken runs anyway when no voice has STARTED within this time: the words that
+    held it were dropped before the voice (the spoken-text guard) or made no sound. Unset =
+    stock (it waits for the voice, whatever happens)."""
+    raw = os.environ.get("SVP_HELD_TRANSITION_TIMEOUT_MS", "").strip()
+    try:
+        value = float(raw) / 1000 if raw else None
+    except ValueError:
+        return None
+    return value if value and value > 0 else None
 
 
 def _counts_as_speech(content: str) -> bool:
@@ -270,6 +284,9 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
 
         # Store node-transition calls that need to be executed after TTS.
         self._pending_node_transition_function_calls: list[FunctionCallFromLLM] = []
+        # P-47: whether a voice started since a step change was held, and the guard's task
+        self._svp_voice_started = False
+        self._svp_held_guard = None
 
     def create_client(
         self,
@@ -723,10 +740,32 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 f"{self}: Deferring {len(function_calls)} node-transition "
                 "function calls until after TTS"
             )
+            await self._svp_guard_held_transition()
             return
 
         logger.debug(f"{self}: Executing {len(function_calls)} function calls")
         await self.run_function_calls(function_calls)
+
+    async def _svp_guard_held_transition(self) -> None:
+        """P-47: start the watch over a held step change (no-op when switched off)."""
+        timeout = svp_held_transition_timeout()
+        if timeout is None:
+            return
+        self._svp_voice_started = False
+        if self._svp_held_guard is not None:
+            await self.cancel_task(self._svp_held_guard)
+        self._svp_held_guard = self.create_task(
+            self._svp_run_held_if_silent(timeout), name="svp_held_transition_guard"
+        )
+
+    async def _svp_run_held_if_silent(self, timeout: float) -> None:
+        await asyncio.sleep(timeout)
+        self._svp_held_guard = None
+        if self._pending_node_transition_function_calls and not self._svp_voice_started:
+            logger.warning(
+                f"P-47: no voice started within {timeout}s for the held step change; it runs now"
+            )
+            await self._run_pending_node_transition_function_calls()
 
     async def _run_pending_node_transition_function_calls(self) -> None:
         if not self._pending_node_transition_function_calls:
@@ -754,6 +793,9 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         # Handle BotStoppedSpeakingFrame to execute pending node-transition calls.
         if isinstance(frame, BotStoppedSpeakingFrame):
             await self._run_pending_node_transition_function_calls()
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, BotStartedSpeakingFrame):
+            self._svp_voice_started = True  # P-47: the held step change waits for this voice
             await self.push_frame(frame, direction)
         elif isinstance(frame, LLMContextFrame):
             try:
