@@ -127,3 +127,74 @@ async def test_pending_node_transition_batch_runs_after_tts():
 
     service.run_function_calls.assert_awaited_once_with([function_call])
     assert service._pending_node_transition_function_calls == []
+
+
+# --- P-45 (Swiss Voice Platform): blank text before a tool call is not speech ---------------
+
+
+def _chunk(content=None, tool_name=None):
+    from openai.types.chat import ChatCompletionChunk
+    from openai.types.chat.chat_completion_chunk import (
+        Choice,
+        ChoiceDelta,
+        ChoiceDeltaToolCall,
+        ChoiceDeltaToolCallFunction,
+    )
+
+    tool_calls = None
+    if tool_name:
+        tool_calls = [
+            ChoiceDeltaToolCall(
+                index=0,
+                id="call-1",
+                type="function",
+                function=ChoiceDeltaToolCallFunction(name=tool_name, arguments="{}"),
+            )
+        ]
+    return ChatCompletionChunk(
+        id="c",
+        object="chat.completion.chunk",
+        created=0,
+        model="inference-deepseek-v32",
+        choices=[Choice(index=0, delta=ChoiceDelta(content=content, tool_calls=tool_calls))],
+    )
+
+
+async def _stream_signal(monkeypatch, switch: str | None, chunks) -> bool:
+    """What `_process_context` tells the deferral about this reply's text."""
+    if switch is None:
+        monkeypatch.delenv("SVP_SPOKEN_TEXT_ONLY", raising=False)
+    else:
+        monkeypatch.setenv("SVP_SPOKEN_TEXT_ONLY", switch)
+    service = _make_service()
+
+    async def stream():
+        for c in chunks:
+            yield c
+
+    service.get_chat_completions = AsyncMock(return_value=stream())
+    service._push_llm_text = AsyncMock()
+    service.push_frame = AsyncMock()
+    seen = {}
+
+    async def capture(function_calls, *, text_generated):
+        seen["text_generated"] = text_generated
+
+    service._run_or_defer_function_calls = capture
+    await service._process_context(LLMContext())
+    return seen["text_generated"]
+
+
+@pytest.mark.asyncio
+async def test_p45_a_blank_line_before_a_step_change_is_not_speech(monkeypatch):
+    # DeepSeek V3.2 / V4 Flash at Phoeniqs, 2026-10-30: « \n\n » then the tool call
+    chunks = [_chunk(content="\n\n"), _chunk(tool_name="vers_rendez_vous")]
+    assert await _stream_signal(monkeypatch, "on", chunks) is False
+    # stock: the blank line counted, the transition waited for a voice that never spoke
+    assert await _stream_signal(monkeypatch, None, chunks) is True
+
+
+@pytest.mark.asyncio
+async def test_p45_words_before_a_step_change_still_wait_for_the_voice(monkeypatch):
+    chunks = [_chunk(content="\n"), _chunk(content="Un instant."), _chunk(tool_name="vers_fin")]
+    assert await _stream_signal(monkeypatch, "on", chunks) is True

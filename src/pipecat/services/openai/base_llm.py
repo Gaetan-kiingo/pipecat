@@ -8,6 +8,7 @@
 
 import asyncio
 import json
+import os
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -45,6 +46,22 @@ from pipecat.services.settings import NOT_GIVEN as _NOT_GIVEN
 from pipecat.services.settings import LLMSettings, _NotGiven, assert_given
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.tracing.service_decorators import traced_llm
+
+
+
+def svp_spoken_text_only() -> bool:
+    """P-45 (Swiss Voice Platform): `SVP_SPOKEN_TEXT_ONLY=on` - a reply's text counts as speech
+    (a node transition then waits for the voice to finish) only once it holds a letter or a
+    digit. DeepSeek at Phoeniqs streams « \\n\\n » before every tool call: counted as speech, the
+    transition waited for a voice that never spoke and the call fell silent (2026-10-30, runs
+    9-10). Unset = stock (any non-empty chunk counts)."""
+    return os.environ.get("SVP_SPOKEN_TEXT_ONLY", "").strip().lower() in ("on", "1", "true")
+
+
+def _counts_as_speech(content: str) -> bool:
+    if not svp_spoken_text_only():
+        return True
+    return any(ch.isalnum() for ch in content)
 
 
 @dataclass
@@ -538,7 +555,8 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                         # Keep iterating through the response to collect all the argument fragments
                         arguments += tool_call.function.arguments
                 elif chunk.choices[0].delta.content:
-                    text_generated_signal = True
+                    if _counts_as_speech(chunk.choices[0].delta.content):  # P-45
+                        text_generated_signal = True
                     await self._push_llm_text(chunk.choices[0].delta.content)
 
                 # When gpt-4o-audio / gpt-4o-mini-audio is used for llm or stt+llm
