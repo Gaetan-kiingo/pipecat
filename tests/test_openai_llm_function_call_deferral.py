@@ -256,3 +256,104 @@ async def test_p47_switched_off_is_stock(monkeypatch):
         [_make_function_call("vers_rendez_vous", "c1")], text_generated=True
     )
     assert tasks == []
+
+
+# --- P-48 (Swiss Voice Platform): words said with a tool call are not spoken ---------------------
+
+
+async def _p48_stream(monkeypatch, switch, chunks):
+    if switch is None:
+        monkeypatch.delenv("SVP_SILENT_TOOL_TEXT", raising=False)
+    else:
+        monkeypatch.setenv("SVP_SILENT_TOOL_TEXT", switch)
+    monkeypatch.delenv("SVP_SPOKEN_TEXT_ONLY", raising=False)
+    service = _make_service()
+
+    async def stream():
+        for c in chunks:
+            yield c
+
+    service.get_chat_completions = AsyncMock(return_value=stream())
+    service._push_llm_text = AsyncMock()
+    service.push_frame = AsyncMock()
+    seen = {}
+
+    async def capture(function_calls, *, text_generated):
+        seen["text_generated"] = text_generated
+        seen["functions"] = [fc.function_name for fc in function_calls]
+
+    service._run_or_defer_function_calls = capture
+    await service._process_context(LLMContext())
+    spoken = [c.args[0] for c in service._push_llm_text.await_args_list]
+    return spoken, seen
+
+
+@pytest.mark.asyncio
+async def test_p48_words_said_with_a_tool_call_are_not_spoken(monkeypatch):
+    spoken, seen = await _p48_stream(
+        monkeypatch,
+        "on",
+        [
+            _chunk("Je vais chercher"),
+            _chunk(" cette information dans nos documents."),
+            _chunk(tool_name="lookup_knowledge"),
+        ],
+    )
+    assert spoken == []
+    assert seen == {"text_generated": False, "functions": ["lookup_knowledge"]}
+
+
+@pytest.mark.asyncio
+async def test_p48_a_narrated_step_change_is_not_spoken_and_runs_at_once(monkeypatch):
+    spoken, seen = await _p48_stream(
+        monkeypatch,
+        "on",
+        [_chunk("Je vais terminer l'appel."), _chunk(tool_name="l_appelant_a_termine")],
+    )
+    assert spoken == []
+    assert seen["text_generated"] is False  # nothing waits for a voice that will not come
+
+
+@pytest.mark.asyncio
+async def test_p48_two_sentences_before_a_tool_call_are_speech_the_hold_cannot_tell(monkeypatch):
+    """The hold judges the first sentence only: a narration of two sentences before a step
+    change is spoken - the spoken-text guard's sign for a narrated end of the call (P-47
+    amended) is what drops « Je vais terminer l'appel » there."""
+    spoken, _ = await _p48_stream(
+        monkeypatch,
+        "on",
+        [
+            _chunk("Le client n'a pas d'autre demande. Je vais terminer l'appel."),
+            _chunk(tool_name="l_appelant_a_termine"),
+        ],
+    )
+    assert spoken == ["Le client n'a pas d'autre demande. Je vais terminer l'appel."]
+
+
+@pytest.mark.asyncio
+async def test_p48_a_one_sentence_answer_is_spoken_when_the_reply_ends(monkeypatch):
+    spoken, seen = await _p48_stream(
+        monkeypatch, "on", [_chunk("Oui, la bêta"), _chunk(" est gratuite.")]
+    )
+    assert spoken == ["Oui, la bêta est gratuite."]
+    assert seen == {}  # no function call
+
+
+@pytest.mark.asyncio
+async def test_p48_a_second_sentence_releases_the_first_at_once(monkeypatch):
+    spoken, _ = await _p48_stream(
+        monkeypatch, "on", [_chunk("Bonjour."), _chunk(" Comment"), _chunk(" puis-je vous aider ?")]
+    )
+    assert spoken == ["Bonjour. Comment", " puis-je vous aider ?"]
+
+
+@pytest.mark.asyncio
+async def test_p48_switched_off_is_stock(monkeypatch):
+    spoken, seen = await _p48_stream(
+        monkeypatch,
+        None,
+        [_chunk("Je vais chercher dans nos documents."), _chunk(tool_name="lookup_knowledge")],
+    )
+    assert spoken == ["Je vais chercher dans nos documents."]
+    assert seen["text_generated"] is True
+

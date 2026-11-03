@@ -9,6 +9,7 @@
 import asyncio
 import json
 import os
+import re
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -58,6 +59,21 @@ def svp_spoken_text_only() -> bool:
     transition waited for a voice that never spoke and the call fell silent (2026-10-30, runs
     9-10). Unset = stock (any non-empty chunk counts)."""
     return os.environ.get("SVP_SPOKEN_TEXT_ONLY", "").strip().lower() in ("on", "1", "true")
+
+
+def svp_silent_tool_text() -> bool:
+    """P-48 (Swiss Voice Platform): `SVP_SILENT_TOOL_TEXT=on` - words a model says in the same
+    reply as a tool call are not spoken. The reply's first sentence is held until the reply
+    shows it is speech (a second sentence starts, or the reply ends); a tool call arriving
+    first drops it. The rule « Un instant » is the runtime's alone (ADR-033) then holds
+    whatever the model does: DeepSeek V4 Flash announced every lookup (« Je vais chercher
+    cette information dans nos documents ») and narrated its step changes (« Je vais terminer
+    l'appel »), and the voice of those words delayed the real answer by about two seconds
+    (the owner's first call on the beta, 2026-11-03). Unset = stock."""
+    return os.environ.get("SVP_SILENT_TOOL_TEXT", "").strip().lower() in ("on", "1", "true")
+
+
+_SVP_SECOND_SENTENCE = re.compile(r"[.!?…]\s+\S")
 
 
 def svp_held_transition_timeout() -> float | None:
@@ -581,6 +597,22 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         # Flag to store whether some text was generated in the current generation
         text_generated_signal = False
 
+        # P-48: the first sentence is held until the reply proves it is speech
+        svp_hold = svp_silent_tool_text()
+        svp_held = ""
+        svp_released = not svp_hold
+
+        async def svp_push_text(text: str) -> None:
+            nonlocal svp_held, svp_released
+            if svp_released:
+                await self._push_llm_text(text)
+                return
+            svp_held += text
+            if _SVP_SECOND_SENTENCE.search(svp_held):
+                svp_released = True
+                await self._push_llm_text(svp_held)
+                svp_held = ""
+
         await self.start_ttfb_metrics()
 
         # Generate chat completions from LLMContext
@@ -653,6 +685,17 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                     # yield a frame containing the function name and the arguments.
 
                     tool_call = chunk.choices[0].delta.tool_calls[0]
+                    if svp_hold and not svp_released:
+                        # P-48: the words that came with this tool call are not spoken, and
+                        # nothing waits for a voice that will not come (P-47)
+                        if svp_held.strip():
+                            logger.info(
+                                f"P-48: {len(svp_held)} characters said with a tool call were "
+                                "not spoken"
+                            )
+                        svp_held = ""
+                        svp_released = True
+                        text_generated_signal = False
                     if tool_call.index != func_idx:
                         functions_list.append(function_name)
                         arguments_list.append(arguments or "{}")
@@ -670,7 +713,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 elif chunk.choices[0].delta.content:
                     if _counts_as_speech(chunk.choices[0].delta.content):  # P-45
                         text_generated_signal = True
-                    await self._push_llm_text(chunk.choices[0].delta.content)
+                    await svp_push_text(chunk.choices[0].delta.content)
 
                 # When gpt-4o-audio / gpt-4o-mini-audio is used for llm or stt+llm
                 # we need to get LLMTextFrame for the transcript
@@ -680,6 +723,12 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                     and chunk.choices[0].delta.audio.get("transcript")
                 ):
                     await self.push_frame(LLMTextFrame(chunk.choices[0].delta.audio["transcript"]))
+
+        # P-48: a reply that ended with its first sentence still held is speech
+        if svp_held:
+            svp_released = True
+            await self._push_llm_text(svp_held)
+            svp_held = ""
 
         # if we got a function name and arguments, check to see if it's a function with
         # a registered handler. If so, run the registered callback, save the result to
