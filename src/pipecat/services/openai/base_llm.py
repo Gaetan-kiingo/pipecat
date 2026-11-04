@@ -63,11 +63,20 @@ def svp_spoken_text_only() -> bool:
 
 def svp_with_turn_context(params: dict, extra: str | None) -> dict:
     """P-50 EXPERIMENT (Swiss Voice Platform): passages the runtime retrieved for this turn,
-    as one system message at the END of the request - the cached prefix and the
-    conversation untouched, nothing kept in the context. None/empty = the params as they are."""
+    appended to the LAST USER message of the request - the cached prefix and the stored
+    conversation untouched, nothing kept in the context. A trailing system message was tried
+    first (2026-11-04, runs 2301-2303): DeepSeek V4 Flash answered it with its reasoning
+    mode, `</think>` in the text and a first token at 1-3 s. None/empty = the params as they
+    are; no user message = nothing added."""
     if not extra or not isinstance(params.get("messages"), list):
         return params
-    return {**params, "messages": [*params["messages"], {"role": "system", "content": extra}]}
+    messages = list(params["messages"])
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str):
+            messages[i] = {**m, "content": f"{m['content']}\n\n{extra}"}
+            return {**params, "messages": messages}
+    return params
 
 
 def svp_silent_tool_text() -> bool:
