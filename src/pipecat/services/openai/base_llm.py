@@ -61,6 +61,15 @@ def svp_spoken_text_only() -> bool:
     return os.environ.get("SVP_SPOKEN_TEXT_ONLY", "").strip().lower() in ("on", "1", "true")
 
 
+def svp_with_turn_context(params: dict, extra: str | None) -> dict:
+    """P-50 EXPERIMENT (Swiss Voice Platform): passages the runtime retrieved for this turn,
+    as one system message at the END of the request - the cached prefix and the
+    conversation untouched, nothing kept in the context. None/empty = the params as they are."""
+    if not extra or not isinstance(params.get("messages"), list):
+        return params
+    return {**params, "messages": [*params["messages"], {"role": "system", "content": extra}]}
+
+
 def svp_silent_tool_text() -> bool:
     """P-48 (Swiss Voice Platform): `SVP_SILENT_TOOL_TEXT=on` - words a model says in the same
     reply as a tool call are not spoken. The reply's first sentence is held until the reply
@@ -385,6 +394,11 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         )
 
         params = self.build_chat_completion_params(params_from_context)
+        # P-50 experiment: the passages the runtime retrieved for this turn, once
+        svp_extra = getattr(self, "_svp_turn_context", None)
+        if svp_extra:
+            params = svp_with_turn_context(params, svp_extra)
+            self._svp_turn_context = None
 
         if self._svp_fallback:
             return await self._svp_completions_with_fallback(params)
