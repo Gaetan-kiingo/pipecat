@@ -250,7 +250,11 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 same approved chain (``base_url``, ``api_key``, ``model``, ``extra_body``,
                 ``after_secs``): a request whose first chunk has not come within
                 ``after_secs``, or that fails before it, is asked again of this engine in the
-                same turn; after two such turns the rest of the call stays on it.
+                same turn; after two such turns the rest of the call stays on it. Amended
+                2026-11-06 (CF-137, CF-238): the first chunk that counts carries words or a
+                tool call (an empty or role-only delta does not), and ``stall_secs`` (None =
+                no watch) bounds the wait between chunks once the answer has begun - a stall
+                then ends the turn with what was said, never a retry after it.
             **kwargs: Additional arguments passed to the parent LLMService.
         """
         # 1. Initialize default_settings with hardcoded defaults
@@ -447,6 +451,59 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
 
     _SVP_SWITCH_AFTER_FAILURES = 2
 
+    @staticmethod
+    def _svp_usable(chunk) -> bool:
+        """Whether a chunk is the engine's answer: words or a tool call.
+
+        CF-238 (2026-10-31): Phoeniqs answered 200 in 0.8 s, then no words for 60 s - the
+        first chunk had come, so the fallback never took over.
+        """
+        for choice in getattr(chunk, "choices", None) or []:
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                continue
+            if getattr(delta, "tool_calls", None):
+                return True
+            content = getattr(delta, "content", None)
+            if isinstance(content, str) and content.strip():
+                return True
+        return False
+
+    def _svp_watched(self, stream, iterator, early: list, model: str):
+        """The chunks already read, then the rest of the stream, watched between chunks.
+
+        Each chunk is awaited at most ``stall_secs`` once the answer has begun (CF-137): a
+        stall ends the turn with what was said; the stream is closed whatever happens.
+        """
+        stall = (self._svp_fallback or {}).get("stall_secs")
+
+        async def chunks():
+            try:
+                for chunk in early:
+                    yield chunk
+                while True:
+                    try:
+                        if stall:
+                            chunk = await asyncio.wait_for(iterator.__anext__(), timeout=stall)
+                        else:
+                            chunk = await iterator.__anext__()
+                    except StopAsyncIteration:
+                        return
+                    except TimeoutError:
+                        logger.warning(
+                            f"P-46: {model} stalled {stall}s after its first words; the turn "
+                            "ends with what was said"
+                        )
+                        return
+                    yield chunk
+            finally:
+                try:
+                    await stream.close()
+                except Exception:  # noqa: BLE001 - a stream already gone is closed enough
+                    pass
+
+        return chunks()
+
     def _svp_fallback_params(self, params: dict) -> dict:
         fallback = self._svp_fallback or {}
         out = {k: v for k, v in params.items() if k != "extra_body"}
@@ -467,12 +524,14 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         )
         timeout = max((self._retry_timeout_secs or 5.0) * 2, 5.0)
         try:
-            return await asyncio.wait_for(
+            stream = await asyncio.wait_for(
                 self._svp_fallback_client.chat.completions.create(
                     **self._svp_fallback_params(params)
                 ),
                 timeout=timeout,
             )
+            # CF-137: the fallback's stream is watched between chunks like the primary's
+            return self._svp_watched(stream, stream.__aiter__(), [], fallback["model"])
         except (TimeoutError, APITimeoutError) as e:
             # Surfaces through process_frame as on_completion_timeout + push_error.
             raise httpx.TimeoutException(
@@ -488,32 +547,32 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         loop = asyncio.get_running_loop()
         deadline = loop.time() + after
         stream = None
+        early: list = []
         try:
             stream = await asyncio.wait_for(
                 self._client.chat.completions.create(**params), timeout=after
             )
             iterator = stream.__aiter__()
-            first = await asyncio.wait_for(
-                iterator.__anext__(), timeout=max(deadline - loop.time(), 0.01)
-            )
+            # CF-238: an empty or role-only first chunk is not an answer - read on until
+            # words or a tool call, all within the same deadline
+            while True:
+                chunk = await asyncio.wait_for(
+                    iterator.__anext__(), timeout=max(deadline - loop.time(), 0.01)
+                )
+                early.append(chunk)
+                if self._svp_usable(chunk):
+                    break
         except (TimeoutError, APITimeoutError):
-            reason = f"gave no first word within {after}s"
+            reason = f"gave no first word within {after}s" + (
+                f" ({len(early)} chunk(s) without words)" if early else ""
+            )
         except StopAsyncIteration:
             reason = "answered nothing"
         except APIError as e:
             reason = f"failed ({type(e).__name__}: {str(e)[:160]})"
         else:
             self._svp_primary_failures = 0
-
-            async def chunks():
-                try:
-                    yield first
-                    async for chunk in iterator:
-                        yield chunk
-                finally:
-                    await stream.close()
-
-            return chunks()
+            return self._svp_watched(stream, iterator, early, str(self._settings.model))
         if stream is not None:
             try:
                 await stream.close()
