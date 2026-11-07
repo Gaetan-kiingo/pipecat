@@ -79,6 +79,16 @@ def svp_with_turn_context(params: dict, extra: str | None) -> dict:
     return params
 
 
+def svp_tool_call_events() -> bool:
+    """P-53 (Swiss Voice Platform, ADR-002): a tool call announced piece by piece as it streams.
+
+    The event ``on_svp_tool_call_streaming`` gets the function's name, the arguments so far and
+    the call's id, so a listener can act before the call is complete.
+    ``SVP_WRITE_PROGRESS_EARLY=on``; unset = stock, no event.
+    """
+    return os.getenv("SVP_WRITE_PROGRESS_EARLY", "").strip().lower() in ("on", "1", "true")
+
+
 def svp_silent_tool_text() -> bool:
     """P-48 (Swiss Voice Platform): `SVP_SILENT_TOOL_TEXT=on` - words a model says in the same
     reply as a tool call are not spoken. The reply's first sentence is held until the reply
@@ -325,6 +335,8 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         # P-47: whether a voice started since a step change was held, and the guard's task
         self._svp_voice_started = False
         self._svp_held_guard = None
+        # P-53: the pieces of a tool call as they stream (a synchronous listener, kept short)
+        self._register_event_handler("on_svp_tool_call_streaming", sync=True)
 
     def create_client(
         self,
@@ -679,6 +691,9 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         # Flag to store whether some text was generated in the current generation
         text_generated_signal = False
 
+        # P-53: the pieces of a tool call announced as they stream
+        svp_events = svp_tool_call_events()
+
         # P-48: the first sentence is held until the reply proves it is speech
         svp_hold = svp_silent_tool_text()
         svp_held = ""
@@ -792,6 +807,10 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                     if tool_call.function and tool_call.function.arguments:
                         # Keep iterating through the response to collect all the argument fragments
                         arguments += tool_call.function.arguments
+                    if svp_events and function_name:
+                        await self._call_event_handler(
+                            "on_svp_tool_call_streaming", function_name, arguments, tool_call_id
+                        )
                 elif chunk.choices[0].delta.content:
                     if _counts_as_speech(chunk.choices[0].delta.content):  # P-45
                         text_generated_signal = True
